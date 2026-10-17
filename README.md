@@ -34,23 +34,11 @@ at runtime. The XP build is the more portable of the two.
 
 ## Modern Build
 
-Run `build.bat` from a normal command prompt (it calls `vcvars64.bat` from VS 2022 Community itself).
-
-Output is `MultiPing.exe` (64-bit), statically linked against the CRT (`/MT`); its only imports are `user32`, 
-`gdi32`, `kernel32`, `iphlpapi` and `ws2_32`. It requires Windows 7 SP1 or later.
-
-The build script embeds the current git short revision, shown under the copyright at the top right.
-
-The application icon (`MultiPing.ico`) is generated from the Segoe UI Emoji waving hand by
-`tools/make_icon.py` (needs Python with Pillow) and embedded via `MultiPing.rc`.
+`build.bat` produces `MultiPing.exe`, a 64-bit build that requires Windows 7 SP1 or later,
+statically linked against the C Runtime; its only imports are `user32`, `gdi32`, `kernel32`, `iphlpapi` and `ws2_32`.
 
 ## Windows XP build
 
 `build_mingw.bat` produces `MultiPingXP.exe`, a 32-bit build that runs on Windows XP SP3 and later, using
 MinGW-w64 GCC from MSYS2's `mingw32` environment (i686, linked against `msvcrt.dll`, static libgcc and
-libstdc++). It looks for MSYS2 in `%MSYS2_ROOT%`, then `%LOCALAPPDATA%\msys64` (a per-user install), then
-`C:\msys64` (machine-wide, as on GitHub's `windows-latest` runner); the package it needs is
-`mingw-w64-i686-gcc`. The manifest for themed controls comes from `MultiPing.manifest` via the resource file.
-
-On XP, the app uses Tahoma instead of Segoe UI, shows the app icon beside the title instead of the emoji (no emoji
-font), and draws the delete button without antialiasing (no Direct2D). Everything else works the same. 
+libstdc++).
