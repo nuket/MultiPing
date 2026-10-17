@@ -1276,8 +1276,13 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int nShow)
     wc.lpfnWndProc = MainProc;
     wc.lpszClassName = L"MultiPingMain";
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
-    wc.hIconSm = LoadIcon(NULL, IDI_APPLICATION);
+    // Icon resource 1 from MultiPing.rc; fall back to the stock icon if the resource is missing.
+    wc.hIcon = (HICON)LoadImageW(hi, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                 GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR);
+    wc.hIconSm = (HICON)LoadImageW(hi, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                   GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+    if (!wc.hIcon) wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    if (!wc.hIconSm) wc.hIconSm = wc.hIcon;
     RegisterClassExW(&wc);
 
     RECT r = { 0, 0, MinContentWidth() + S(95), ContentHeightFor(8) };   // 8 rows, graph about 335 px wide

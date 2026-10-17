@@ -11,6 +11,8 @@ Run `build.bat` from a normal command prompt (it calls `vcvars64.bat` from VS 20
 Output is `MultiPing.exe`, statically linked against the CRT (`/MT`); its only imports are
 `user32`, `gdi32`, `kernel32`, `iphlpapi` and `ws2_32`.
 The build script embeds the current git short revision, shown under the copyright at the top right.
+The application icon (`MultiPing.ico`) is generated from the Segoe UI Emoji waving hand by
+`tools/make_icon.py` (needs Python with Pillow) and embedded via `MultiPing.rc`.
 
 ## Usage
 
