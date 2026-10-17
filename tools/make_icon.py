@@ -3,7 +3,9 @@
 Each icon size is rasterized directly at that size (not downscaled) so small sizes stay crisp.
 Usage: python tools/make_icon.py  (writes MultiPing.ico and tools/icon_preview.png next to it)
 """
+import io
 import os
+import struct
 from PIL import Image, ImageDraw, ImageFont
 
 FONT = r"C:\Windows\Fonts\seguiemj.ttf"
@@ -30,9 +32,51 @@ def render(size: int) -> Image.Image:
     return img
 
 
+def bmp_entry(img: Image.Image) -> bytes:
+    """32-bpp BGRA DIB with an AND mask, as Windows XP's icon loader expects (no PNG support)."""
+    w, h = img.size
+    header = struct.pack("<IiiHHIIiiII", 40, w, h * 2, 1, 32, 0, 0, 0, 0, 0, 0)
+    px = img.load()
+    xor = bytearray()
+    for y in range(h - 1, -1, -1):          # bottom-up rows
+        for x in range(w):
+            r, g, b, a = px[x, y]
+            xor += bytes((b, g, r, a))
+    stride = ((w + 31) // 32) * 4           # 1-bpp mask rows padded to 4 bytes
+    mask = bytearray()
+    for y in range(h - 1, -1, -1):
+        row = 0
+        for x in range(w):
+            if px[x, y][3] < 128:
+                row |= 1 << (stride * 8 - 1 - x)
+        mask += row.to_bytes(stride, "big")
+    return header + bytes(xor) + bytes(mask)
+
+
+def png_entry(img: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def write_ico(path: str, frames: list) -> None:
+    # BMP entries for sizes up to 64 px so XP can use them; PNG for the big ones (Vista and later).
+    entries = [(f, bmp_entry(f) if f.width <= 64 else png_entry(f)) for f in frames]
+    offset = 6 + 16 * len(entries)
+    out = bytearray(struct.pack("<HHH", 0, 1, len(entries)))
+    for f, data in entries:
+        w = f.width if f.width < 256 else 0
+        out += struct.pack("<BBBBHHII", w, w, 0, 0, 1, 32, len(data), offset)
+        offset += len(data)
+    for _, data in entries:
+        out += data
+    with open(path, "wb") as fh:
+        fh.write(out)
+
+
 def main() -> None:
     frames = [render(s) for s in SIZES]
-    frames[-1].save(OUT, format="ICO", sizes=[(s, s) for s in SIZES], append_images=frames[:-1])
+    write_ico(OUT, frames)
     # Preview strip for a quick visual check.
     strip = Image.new("RGBA", (sum(SIZES) + 10 * len(SIZES), 256), (240, 240, 240, 255))
     x = 5

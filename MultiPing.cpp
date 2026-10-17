@@ -125,6 +125,8 @@ struct Row {
 
 static HWND     g_hwnd;
 static HFONT    g_font, g_fontSmall, g_fontLogo, g_fontEmoji, g_fontInfo;
+static HICON    g_titleIcon;      // app icon drawn beside the title where no emoji font exists (XP)
+#define TITLE_ICON_PX 36          // 96-dpi px
 
 // Direct2D / DirectWrite, used only to draw the title emoji in color. Loaded on demand; when
 // unavailable the emoji is drawn with GDI in monochrome instead.
@@ -1087,6 +1089,10 @@ static void CreateFonts()
                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                              DEFAULT_PITCH | FF_DONTCARE, g_uiFace);
     CreateEmojiFormat();
+
+    if (g_titleIcon) DestroyIcon(g_titleIcon);
+    g_titleIcon = (HICON)LoadImageW(GetModuleHandle(NULL), MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                    S(TITLE_ICON_PX), S(TITLE_ICON_PX), LR_DEFAULTCOLOR);
     g_fontLogo = CreateFontW(-MulDiv(FONT_LOGO_PT, (int)g_dpi, 72), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                              DEFAULT_PITCH | FF_DONTCARE, g_uiFace);
@@ -1126,7 +1132,14 @@ static void PaintMain(HWND h)
     lr.left += ts.cx + S(10);
     RECT er = { lr.left, lr.top, lr.left + S(LOGO_H) * 3 / 2, lr.bottom };
     if (!g_haveEmojiFont) {
-        er.right = lr.left;               // no emoji font on this system (e.g. Windows XP): skip it
+        // No emoji font on this system (e.g. Windows XP): draw the app icon in its place instead.
+        if (g_titleIcon) {
+            int sz = S(TITLE_ICON_PX);
+            DrawIconEx(hdc, lr.left, LogoTop() + (S(LOGO_H) - sz) / 2, g_titleIcon, sz, sz, 0, NULL, DI_NORMAL);
+            er.right = lr.left + sz;
+        } else {
+            er.right = lr.left;
+        }
     } else if (!DrawColorEmoji(hdc, er)) {
         SelectObject(hdc, g_fontEmoji);   // monochrome fallback
         DrawTextW(hdc, TITLE_EMOJI, -1, &lr, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
