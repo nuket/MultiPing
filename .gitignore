@@ -6,3 +6,4 @@
 *.res
 *.manifest
 tools/icon_preview.png
+__pycache__/
