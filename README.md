@@ -14,6 +14,16 @@ The build script embeds the current git short revision, shown under the copyrigh
 The application icon (`MultiPing.ico`) is generated from the Segoe UI Emoji waving hand by
 `tools/make_icon.py` (needs Python with Pillow) and embedded via `MultiPing.rc`.
 
+## Windows XP build
+
+`build_xp.bat` produces `MultiPingXP.exe`, a 32-bit build that runs on Windows XP SP3 and later. It needs
+the "C++ Windows XP Support for VS 2017 (v141) tools" component of Visual Studio 2022, which brings the
+MSVC 14.16 toolset, the Windows 7.1A SDK and the UCRT from SDK 10.0.10240.0 (the last one that runs on XP).
+
+On XP the app uses Tahoma instead of Segoe UI, skips the title emoji (no emoji font), and draws the delete
+button without antialiasing (no Direct2D). Everything else works the same. The regular `MultiPing.exe`
+requires Windows 7 SP1 or later.
+
 ## Usage
 
 - Type a host name or IPv4/IPv6 address into a row and press Enter (or click elsewhere) to start pinging it.

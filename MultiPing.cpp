@@ -10,7 +10,9 @@
 #endif
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#define _WIN32_WINNT 0x0601
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601   // build_xp.bat overrides this with 0x0502
+#endif
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -21,6 +23,7 @@
 #include <d2d1.h>      // only for interface declarations; d2d1.dll / dwrite.dll are loaded at runtime
 #include <dwrite.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <string>
 #include <vector>
@@ -49,7 +52,7 @@ enum { RES_NONE = -3, RES_NOHOST = -2, RES_TIMEOUT = -1 };
 #define RING_N            60     // seconds of history shown in the graph
 #define TIMER_TICK        1
 #define PING_INTERVAL_MS  1000   // UI tick: commits last results and releases the next round of pings
-#define PING_TIMEOUT_MS   900    // a little under the interval so every result is in before the next tick
+#define PING_TIMEOUT_MS   800    // under the interval; a result not back by the tick counts as a timeout
 
 // Fonts in points.
 #define FONT_PT        14
@@ -104,6 +107,8 @@ struct PingCtx {
     HANDLE        go;         // auto-reset: worker sends one ping
     volatile LONG ready;      // 1 when `result` holds a fresh value
     volatile LONG result;     // microseconds (>= 0) or RES_* code
+    volatile LONG seq;        // UI: sequence number of the ping most recently released with `go`
+    volatile LONG resultSeq;  // worker: sequence number the current `result` answers
     bool          inflight;   // UI side: a `go` has been issued whose result is not yet taken
 };
 
@@ -130,6 +135,34 @@ static IDWriteTextFormat*   g_emojiFmt;
 static bool                 g_d2dTried;
 static bool InitD2D();
 static bool DrawDeleteD2D(HDC hdc, const RECT& rc, COLORREF circle);
+
+// UI face: Segoe UI where it exists (Vista and later), otherwise Tahoma (Windows XP).
+static const wchar_t* g_uiFace = L"Segoe UI";
+static bool           g_haveEmojiFont;   // Segoe UI Emoji present; without it the title emoji is skipped
+
+static int CALLBACK FontFoundProc(const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM found)
+{
+    *(bool*)found = true;
+    return 0;
+}
+
+static bool FontExists(const wchar_t* face)
+{
+    LOGFONTW lf; ZeroMemory(&lf, sizeof lf);
+    lf.lfCharSet = DEFAULT_CHARSET;
+    wcscpy_s(lf.lfFaceName, face);
+    bool found = false;
+    HDC dc = GetDC(NULL);
+    EnumFontFamiliesExW(dc, &lf, FontFoundProc, (LPARAM)&found, 0);
+    ReleaseDC(NULL, dc);
+    return found;
+}
+
+static void DetectFonts()
+{
+    if (!FontExists(L"Segoe UI")) g_uiFace = L"Tahoma";
+    g_haveEmojiFont = FontExists(L"Segoe UI Emoji");
+}
 
 // Emoji appended to the title: U+1F44B (waving hand) as its UTF-16 surrogate pair. Drawn with
 // Segoe UI Emoji, which GDI renders in monochrome outline form.
@@ -173,6 +206,7 @@ static DWORD WINAPI PingThread(LPVOID p)
         // Wait for the UI tick to release this round's ping (or for shutdown).
         HANDLE waits[2] = { c->stop, c->go };
         if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) break;
+        LONG seq = c->seq;   // the round this ping answers; the UI discards results from older rounds
 
         if (icmp == INVALID_HANDLE_VALUE) {
             addrinfo hints; ZeroMemory(&hints, sizeof hints);
@@ -196,6 +230,7 @@ static DWORD WINAPI PingThread(LPVOID p)
             }
             if (icmp == INVALID_HANDLE_VALUE) {
                 InterlockedExchange(&c->result, RES_NOHOST);
+                InterlockedExchange(&c->resultSeq, seq);
                 InterlockedExchange(&c->ready, 1);
                 continue;   // retried on the next tick
             }
@@ -225,6 +260,7 @@ static DWORD WINAPI PingThread(LPVOID p)
         }
         if (ok) result = (LPARAM)((qb.QuadPart - qa.QuadPart) * 1000000 / freq.QuadPart);
         InterlockedExchange(&c->result, (LONG)result);
+        InterlockedExchange(&c->resultSeq, seq);
         InterlockedExchange(&c->ready, 1);
     }
 
@@ -253,6 +289,8 @@ static void StartPing(Row* r)
     c->go = CreateEvent(NULL, FALSE, FALSE, NULL);
     c->ready = 0;
     c->result = RES_NONE;
+    c->seq = 1;
+    c->resultSeq = 0;
     c->inflight = false;
     HANDLE h = CreateThread(NULL, 0, PingThread, c, 0, NULL);
     if (!h) { CloseHandle(c->stop); CloseHandle(c->go); delete c; return; }
@@ -442,6 +480,23 @@ static int RowsThatFit()
     return fit < 1 ? 1 : fit;
 }
 
+#ifdef MP_DEBUG_LOG
+static void LogF(const char* fmt, ...)
+{
+    char buf[512];
+    va_list ap; va_start(ap, fmt);
+    int n = vsprintf_s(buf, fmt, ap);
+    va_end(ap);
+    HANDLE f = CreateFileW(L"C:\\devsrc\\mp.log", FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD w; WriteFile(f, buf, (DWORD)n, &w, NULL); WriteFile(f, "\r\n", 2, &w, NULL);
+    CloseHandle(f);
+}
+#define LOG(...) LogF(__VA_ARGS__)
+#else
+#define LOG(...) ((void)0)
+#endif
+
 static void Layout()
 {
     RECT rc; GetClientRect(g_hwnd, &rc);
@@ -449,21 +504,27 @@ static void Layout()
     int ch = S(CTRL_H);
     int fit = RowsThatFit();
     HDWP dwp = BeginDeferWindowPos((int)g_rows.size() * 8);
+    LOG("Layout: rows=%d client=%dx%d fit=%d first=%d dpi=%u dwp=%p x0=%d w0=%d xg=%d wg=%d",
+        (int)g_rows.size(), rc.right, rc.bottom, fit, g_firstRow, g_dpi, (void*)dwp, c.x[0], c.w[0], c.x[C_GRAPH], c.w[C_GRAPH]);
     for (size_t i = 0; i < g_rows.size(); i++) {
         Row* r = g_rows[i];
         bool shown = (int)i >= g_firstRow && (int)i < g_firstRow + fit;
         int y = RowsTop() + ((int)i - g_firstRow) * S(ROW_H);
         int yc = y + (S(ROW_H) - ch) / 2;
-        UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | (shown ? SWP_SHOWWINDOW : SWP_HIDEWINDOW);
         HWND ctl[NCOL] = { r->edit, r->cur, r->mn, r->med, r->avg, r->mx, r->graph, r->del };
         for (int k = 0; k < NCOL; k++) {
             int cy = yc, chh = ch;
             if (k == C_GRAPH) { cy = y + S(3); chh = S(ROW_H) - S(6); }
             if (k == C_DEL)   { cy = y + (S(ROW_H) - c.w[C_DEL]) / 2; chh = c.w[C_DEL]; }
-            dwp = DeferWindowPos(dwp, ctl[k], NULL, c.x[k], cy, c.w[k], chh, flags);
+            // Show/hide is done separately: DeferWindowPos may not move or size a window in the
+            // same call that shows or hides it (Windows XP enforces this; later versions do not).
+            if (shown != (IsWindowVisible(ctl[k]) != FALSE))
+                ShowWindow(ctl[k], shown ? SW_SHOWNA : SW_HIDE);
+            dwp = DeferWindowPos(dwp, ctl[k], NULL, c.x[k], cy, c.w[k], chh, SWP_NOZORDER | SWP_NOACTIVATE);
+            if (!dwp) LOG("  DeferWindowPos failed row=%d col=%d hwnd=%p err=%lu", (int)i, k, (void*)ctl[k], GetLastError());
         }
     }
-    EndDeferWindowPos(dwp);
+    if (!EndDeferWindowPos(dwp)) LOG("  EndDeferWindowPos failed err=%lu", GetLastError());
     InvalidateRect(g_hwnd, NULL, TRUE);
 }
 
@@ -957,8 +1018,10 @@ static bool DrawColorEmoji(HDC hdc, const RECT& rc)
     g_rt->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Black), &brush);
     D2D1_RECT_F lr = D2D1::RectF(0, 0, (float)(rc.right - rc.left), (float)(rc.bottom - rc.top));
     if (brush) {
+        // D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT (= 4); spelled numerically because the Windows
+        // 7.1A SDK used for the XP build predates it. Ignored by Direct2D versions without color fonts.
         g_rt->DrawText(TITLE_EMOJI, (UINT32)wcslen(TITLE_EMOJI), g_emojiFmt, lr, brush,
-                       D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                       (D2D1_DRAW_TEXT_OPTIONS)4);
         brush->Release();
     }
     HRESULT hr = g_rt->EndDraw();
@@ -1022,20 +1085,20 @@ static void CreateFonts()
     if (g_fontInfo) DeleteObject(g_fontInfo);
     g_fontInfo = CreateFontW(-MulDiv(FONT_INFO_PT, (int)g_dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+                             DEFAULT_PITCH | FF_DONTCARE, g_uiFace);
     CreateEmojiFormat();
     g_fontLogo = CreateFontW(-MulDiv(FONT_LOGO_PT, (int)g_dpi, 72), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+                             DEFAULT_PITCH | FF_DONTCARE, g_uiFace);
     g_fontEmoji = CreateFontW(-MulDiv(FONT_LOGO_PT, (int)g_dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                               OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                               DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Emoji");
     g_font = CreateFontW(-MulDiv(FONT_PT, (int)g_dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+                         DEFAULT_PITCH | FF_DONTCARE, g_uiFace);
     g_fontSmall = CreateFontW(-MulDiv(FONT_SMALL_PT, (int)g_dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                               OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                              DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+                              DEFAULT_PITCH | FF_DONTCARE, g_uiFace);
 }
 
 static void ApplyFonts()
@@ -1062,7 +1125,9 @@ static void PaintMain(HWND h)
     SIZE ts; GetTextExtentPoint32W(hdc, L"MultiPing", 9, &ts);
     lr.left += ts.cx + S(10);
     RECT er = { lr.left, lr.top, lr.left + S(LOGO_H) * 3 / 2, lr.bottom };
-    if (!DrawColorEmoji(hdc, er)) {
+    if (!g_haveEmojiFont) {
+        er.right = lr.left;               // no emoji font on this system (e.g. Windows XP): skip it
+    } else if (!DrawColorEmoji(hdc, er)) {
         SelectObject(hdc, g_fontEmoji);   // monochrome fallback
         DrawTextW(hdc, TITLE_EMOJI, -1, &lr, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
     }
@@ -1169,12 +1234,16 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
             PingCtx* c = r->ctx;
             if (!c) continue;
             if (c->inflight) {
-                if (InterlockedCompareExchange(&c->ready, 0, 1) != 1) continue;  // still waiting (rare)
-                RecordResult(r, (LPARAM)c->result);
-                c->inflight = false;
+                // The tick is authoritative: a result that is not back yet (or answers an older
+                // round) counts as a timeout, so every row commits exactly one sample per tick
+                // whatever the ICMP stack's timing. Windows XP, for one, lets IcmpSendEcho run
+                // past its nominal timeout.
+                bool fresh = InterlockedCompareExchange(&c->ready, 0, 1) == 1 && c->resultSeq == c->seq;
+                RecordResult(r, fresh ? (LPARAM)c->result : (LPARAM)RES_TIMEOUT);
             }
+            c->seq++;
             c->inflight = true;
-            SetEvent(c->go);
+            SetEvent(c->go);   // if the worker is still busy, the auto-reset event holds the request
         }
         return 0;
     }
@@ -1257,6 +1326,18 @@ static void InitDpi()
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int nShow)
 {
     InitDpi();
+    DetectFonts();
+
+    // With the common-controls v6 manifest, the standard EDIT/STATIC classes come from comctl32 v6.
+    // Windows XP only registers them once comctl32 is loaded and initialized (later versions do it
+    // implicitly), so do that here; resolved dynamically to keep comctl32 out of the import table.
+    if (HMODULE cc = LoadLibraryW(L"comctl32.dll")) {
+        struct { DWORD dwSize, dwICC; } icc = { 8, 0x00004000 /* ICC_STANDARD_CLASSES */ };
+        typedef BOOL (WINAPI* PFN_ICCE)(const void*);
+        PFN_ICCE icce = (PFN_ICCE)GetProcAddress(cc, "InitCommonControlsEx");
+        if (icce) icce(&icc);
+    }
+
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
