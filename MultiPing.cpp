@@ -54,7 +54,7 @@ enum { RES_NONE = -3, RES_NOHOST = -2, RES_TIMEOUT = -1 };
 #define FONT_SMALL_PT  9
 
 // Layout metrics in 96-dpi pixels.
-#define MARGIN       8
+#define MARGIN       18     // outer padding around all content
 #define GAP          6
 #define ROW_H        56
 #define HDR_H        30
@@ -237,7 +237,7 @@ static void StartPing(Row* r)
 // Persistence: %APPDATA%\MultiPing\addresses.txt (UTF-8, one address per line)
 // ---------------------------------------------------------------------------------------------
 
-static std::wstring ConfigPath(bool create)
+static std::wstring ConfigDir(bool create)
 {
     wchar_t base[MAX_PATH];
     DWORD n = GetEnvironmentVariableW(L"APPDATA", base, MAX_PATH);
@@ -253,7 +253,67 @@ static std::wstring ConfigPath(bool create)
         dir += L"\\MultiPing";
         if (create) CreateDirectoryW(dir.c_str(), NULL);
     }
-    return dir + L"\\addresses.txt";
+    return dir;
+}
+
+static std::wstring ConfigPath(bool create) { return ConfigDir(create) + L"\\addresses.txt"; }
+
+// Window placement: "left top width height" in screen pixels, in window.txt next to the addresses.
+
+static void SaveWindowRect(HWND h)
+{
+    RECT r;
+    if (IsIconic(h) || IsZoomed(h)) {
+        // Use the restored-state rectangle. It is in workspace coordinates, i.e. relative to the
+        // primary monitor's work area, so shift it back into screen coordinates.
+        WINDOWPLACEMENT wp = { sizeof wp };
+        GetWindowPlacement(h, &wp);
+        r = wp.rcNormalPosition;
+        POINT origin = { 0, 0 };
+        MONITORINFO mi = { sizeof mi };
+        GetMonitorInfoW(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &mi);
+        OffsetRect(&r, mi.rcWork.left, mi.rcWork.top);
+    } else {
+        GetWindowRect(h, &r);
+    }
+    char buf[96];
+    int n = sprintf_s(buf, "%ld %ld %ld %ld\r\n", r.left, r.top, r.right - r.left, r.bottom - r.top);
+    std::wstring path = ConfigDir(true) + L"\\window.txt";
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD wrote;
+    WriteFile(f, buf, (DWORD)n, &wrote, NULL);
+    CloseHandle(f);
+}
+
+// Loads the saved rectangle and makes it fit the work area of the monitor it is nearest to, so a
+// changed screen layout or resolution never leaves the window off screen or larger than the screen.
+static bool LoadWindowRect(RECT* out)
+{
+    std::wstring path = ConfigDir(false) + L"\\window.txt";
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    char buf[128] = { 0 };
+    DWORD got = 0;
+    ReadFile(f, buf, sizeof buf - 1, &got, NULL);
+    CloseHandle(f);
+    long x, y, w, hgt;
+    if (sscanf_s(buf, "%ld %ld %ld %ld", &x, &y, &w, &hgt) != 4) return false;
+    if (w < 100 || hgt < 100 || w > 20000 || hgt > 20000) return false;
+
+    RECT r = { x, y, x + w, y + hgt };
+    MONITORINFO mi = { sizeof mi };
+    if (!GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mi)) return false;
+    const RECT& wa = mi.rcWork;
+    long maxW = wa.right - wa.left, maxH = wa.bottom - wa.top;
+    if (w > maxW) w = maxW;
+    if (hgt > maxH) hgt = maxH;
+    if (x + w > wa.right) x = wa.right - w;
+    if (y + hgt > wa.bottom) y = wa.bottom - hgt;
+    if (x < wa.left) x = wa.left;
+    if (y < wa.top) y = wa.top;
+    out->left = x; out->top = y; out->right = x + w; out->bottom = y + hgt;
+    return true;
 }
 
 static std::wstring Trim(const std::wstring& s)
@@ -668,7 +728,8 @@ static void PaintGraph(HWND h, Row* r)
     FormatMs((double)nice / 1000.0, lv, 32);
     swprintf_s(lbl, L"%s ms", lv);
     HGDIOBJ oldFont = SelectObject(mdc, g_fontSmall);
-    SetBkMode(mdc, TRANSPARENT);
+    SetBkMode(mdc, OPAQUE);                 // white backing keeps the label legible over tall bars
+    SetBkColor(mdc, RGB(255, 255, 255));
     SetTextColor(mdc, RGB(110, 110, 110));
     RECT lr = { plot.left + S(3), plot.top + S(1), plot.right, plot.bottom };
     DrawTextW(mdc, lbl, -1, &lr, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
@@ -981,6 +1042,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_DESTROY:
         g_closing = true;
         KillTimer(h, TIMER_TICK);
+        SaveWindowRect(h);
         SaveAddresses();
         for (Row* r : g_rows) StopPing(r);
         PostQuitMessage(0);
@@ -1034,10 +1096,15 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int nShow)
 
     RECT r = { 0, 0, MinContentWidth() + S(95), ContentHeightFor(8) };   // 8 rows, graph about 335 px wide
     AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, FALSE, 0);
+    int x = CW_USEDEFAULT, y = CW_USEDEFAULT, w = r.right - r.left, hgt = r.bottom - r.top;
+    RECT saved;
+    if (LoadWindowRect(&saved)) {
+        x = saved.left; y = saved.top;
+        w = saved.right - saved.left; hgt = saved.bottom - saved.top;
+    }
     HWND hwnd = CreateWindowExW(0, L"MultiPingMain", L"MultiPing",
                                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VSCROLL,
-                                CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
-                                NULL, NULL, hi, NULL);
+                                x, y, w, hgt, NULL, NULL, hi, NULL);
     if (!hwnd) return 1;
     ShowWindow(hwnd, nShow);
     UpdateWindow(hwnd);

@@ -1,6 +1,9 @@
 # MultiPing
 
+A small Win32 tool that pings a list of hosts once a second and shows, per host, the current
+round-trip time, session min / median / avg / max, and a bar graph of the last 60 seconds.
 
+![MultiPing pinging eight hosts, two of them timing out](screenshot.png)
 
 ## Build
 
@@ -18,4 +21,6 @@ Output is `MultiPing.exe`, statically linked against the CRT (`/MT`); its only i
   one per second, with timeouts drawn in red.
 - The window opens sized for 8 rows; a scrollbar appears only when there are more.
 - Addresses are saved to `%APPDATA%\MultiPing\addresses.txt` on every change and on exit.
+- The window size and position are saved to `window.txt` in the same folder and restored on the next
+  start, clamped to the current screen if the display layout has changed.
 
