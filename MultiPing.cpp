@@ -52,6 +52,8 @@ enum { RES_NONE = -3, RES_NOHOST = -2, RES_TIMEOUT = -1 };
 // Fonts in points.
 #define FONT_PT        14
 #define FONT_SMALL_PT  9
+#define FONT_LOGO_PT   24     // "MultiPing" title at the top, bold
+#define LOGO_H         38     // height reserved for the title (96-dpi px)
 
 // Layout metrics in 96-dpi pixels.
 #define MARGIN       18     // outer padding around all content
@@ -105,7 +107,7 @@ struct Row {
 };
 
 static HWND     g_hwnd;
-static HFONT    g_font, g_fontSmall;
+static HFONT    g_font, g_fontSmall, g_fontLogo;
 static UINT     g_dpi = 96;
 static int      g_scrollY;
 static int      g_nextRowId = 1;
@@ -397,7 +399,9 @@ static int MinContentWidth()
     return w;
 }
 
-static int RowsTop()    { return S(MARGIN) + S(HDR_H) + S(MARGIN) / 2; }
+static int LogoTop()    { return S(MARGIN) / 2; }
+static int HeaderTop()  { return S(MARGIN) + S(LOGO_H); }
+static int RowsTop()    { return HeaderTop() + S(HDR_H) + S(MARGIN) / 2; }
 static int RowTop(size_t i) { return RowsTop() + (int)i * S(ROW_H); }
 static int ContentHeightFor(int rows) { return RowsTop() + rows * S(ROW_H) + S(MARGIN); }
 static int ContentHeight() { return ContentHeightFor((int)g_rows.size()); }
@@ -868,6 +872,10 @@ static void CreateFonts()
 {
     if (g_font) DeleteObject(g_font);
     if (g_fontSmall) DeleteObject(g_fontSmall);
+    if (g_fontLogo) DeleteObject(g_fontLogo);
+    g_fontLogo = CreateFontW(-MulDiv(FONT_LOGO_PT, (int)g_dpi, 72), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
+                             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     g_font = CreateFontW(-MulDiv(FONT_PT, (int)g_dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                          DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
@@ -890,10 +898,16 @@ static void PaintMain(HWND h)
     HDC hdc = BeginPaint(h, &ps);
     RECT rc; GetClientRect(h, &rc);
     Cols c = ComputeCols(rc.right);
-    HGDIOBJ oldFont = SelectObject(hdc, g_font);
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, GetSysColor(COLOR_BTNTEXT));
-    int y = S(MARGIN) - g_scrollY;
+
+    // Title, large and bold, aligned with the Address column.
+    HGDIOBJ oldFont = SelectObject(hdc, g_fontLogo);
+    RECT lr = { c.x[0], LogoTop() - g_scrollY, rc.right, LogoTop() - g_scrollY + S(LOGO_H) };
+    DrawTextW(hdc, L"MultiPing", -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    SelectObject(hdc, g_font);
+    int y = HeaderTop() - g_scrollY;
     for (int k = 0; k < NCOL; k++) {
         RECT r = { c.x[k], y, c.x[k] + c.w[k], y + S(HDR_H) };
         UINT align = (k == C_ADDR || k == C_GRAPH) ? DT_LEFT : DT_RIGHT;
