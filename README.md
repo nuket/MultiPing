@@ -16,8 +16,8 @@ at runtime. The XP build is the more portable of the two.
 |---|---|---|
 | Architecture | x64 | x86 |
 | Runs on | 64-bit Windows 7 SP1 and later | 32-bit and 64-bit Windows XP SP3 and later |
-| Compiler and CRT | MSVC 14.44, current UCRT | MSVC 14.16, UCRT from 2015 |
-| Size | about 296 KB | about 225 KB |
+| Compiler and CRT | MSVC 14.44, current UCRT | MinGW-w64 GCC (MSYS2 mingw32), msvcrt.dll |
+| Size | about 296 KB | about 477 KB |
 
 ## Usage
 
@@ -46,9 +46,15 @@ The application icon (`MultiPing.ico`) is generated from the Segoe UI Emoji wavi
 
 ## Windows XP build
 
-`build_xp.bat` produces `MultiPingXP.exe`, a 32-bit build that runs on Windows XP SP3 and later. It needs
-the "C++ Windows XP Support for VS 2017 (v141) tools" component of Visual Studio 2022, which brings the
-MSVC 14.16 toolset, the Windows 7.1A SDK and the UCRT from SDK 10.0.10240.0 (the last one that runs on XP).
+`build_mingw.bat` produces `MultiPingXP.exe`, a 32-bit build that runs on Windows XP SP3 and later, using
+MinGW-w64 GCC from MSYS2's `mingw32` environment (i686, linked against `msvcrt.dll`, static libgcc and
+libstdc++). It looks for MSYS2 in `%MSYS2_ROOT%`, then `%LOCALAPPDATA%\msys64` (a per-user install), then
+`C:\msys64` (machine-wide, as on GitHub's `windows-latest` runner); the package it needs is
+`mingw-w64-i686-gcc`. The manifest for themed controls comes from `MultiPing.manifest` via the resource file.
+
+`build_xp.bat` is the alternative MSVC route to the same executable. It needs the deprecated "C++ Windows XP
+Support for VS 2017 (v141) tools" component of Visual Studio 2022, which brings the MSVC 14.16 toolset, the
+Windows 7.1A SDK and the UCRT from SDK 10.0.10240.0 (the last one that runs on XP).
 
 On XP, the app uses Tahoma instead of Segoe UI, shows the app icon beside the title instead of the emoji (no emoji
 font), and draws the delete button without antialiasing (no Direct2D). Everything else works the same. 

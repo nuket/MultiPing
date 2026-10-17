@@ -8,11 +8,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # needed only by the release step on tags
+  contents: write   # needed only by the release steps on tags
 
 jobs:
   build:
-    name: MultiPing.exe (x64, Windows 7+)
+    name: MultiPing.exe (x64, Windows 7+, MSVC)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,5 +45,52 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" MultiPing.exe --title "MultiPing ${GITHUB_REF_NAME}" --generate-notes \
-            || gh release upload "${GITHUB_REF_NAME}" MultiPing.exe --clobber
+          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 \
+            || gh release create "${GITHUB_REF_NAME}" --title "MultiPing ${GITHUB_REF_NAME}" --generate-notes \
+            || true
+          gh release upload "${GITHUB_REF_NAME}" MultiPing.exe --clobber
+
+  build-xp:
+    name: MultiPingXP.exe (x86, Windows XP+, MinGW-w64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner's MSYS2 lives in C:\msys64, which build_mingw.bat finds on its own. Only the
+      # 32-bit (i686, msvcrt) GCC has to be added; it is the environment that can still target XP.
+      - name: Install mingw32 GCC into the runner's MSYS2
+        shell: cmd
+        run: |
+          C:\msys64\usr\bin\bash.exe -lc "pacman -Syuu --noconfirm"
+          C:\msys64\usr\bin\bash.exe -lc "pacman -S --noconfirm --needed mingw-w64-i686-gcc"
+          C:\msys64\mingw32\bin\gcc.exe --version
+
+      - name: Build
+        shell: cmd
+        run: call build_mingw.bat
+
+      - name: Check imports
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set VSINST=%%i
+          call "%VSINST%\VC\Auxiliary\Build\vcvars64.bat" >nul
+          dumpbin /nologo /headers MultiPingXP.exe | findstr /c:"machine" /c:"subsystem version"
+          dumpbin /nologo /dependents MultiPingXP.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MultiPingXP
+          path: MultiPingXP.exe
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 \
+            || gh release create "${GITHUB_REF_NAME}" --title "MultiPing ${GITHUB_REF_NAME}" --generate-notes \
+            || true
+          gh release upload "${GITHUB_REF_NAME}" MultiPingXP.exe --clobber

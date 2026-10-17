@@ -32,6 +32,7 @@
 #define _UNICODE
 #endif
 #define WIN32_LEAN_AND_MEAN
+#define _CRT_SECURE_NO_WARNINGS   // _vsnwprintf / _vsnprintf are used on purpose (portable to MinGW)
 #define NOMINMAX
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0601   // build_xp.bat overrides this with 0x0502
@@ -52,12 +53,41 @@
 #include <vector>
 #include <algorithm>
 
+// Small portable replacements for the MSVC-only secure-CRT templates, so the same source builds
+// with MSVC and with MinGW-w64 GCC. Both always NUL-terminate.
+static void CopyW(wchar_t* dst, size_t n, const wchar_t* src)
+{
+    size_t i = 0;
+    for (; i + 1 < n && src[i]; i++) dst[i] = src[i];
+    dst[i] = 0;
+}
+static int FormatW(wchar_t* buf, size_t n, const wchar_t* fmt, ...)
+{
+    va_list ap; va_start(ap, fmt);
+    int r = _vsnwprintf(buf, n, fmt, ap);
+    va_end(ap);
+    if (r < 0 || (size_t)r >= n) { buf[n - 1] = 0; r = (int)wcslen(buf); }
+    return r;
+}
+static int FormatA(char* buf, size_t n, const char* fmt, ...)
+{
+    va_list ap; va_start(ap, fmt);
+    int r = _vsnprintf(buf, n, fmt, ap);
+    va_end(ap);
+    if (r < 0 || (size_t)r >= n) { buf[n - 1] = 0; r = (int)strlen(buf); }
+    return r;
+}
+
+#ifdef _MSC_VER
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 // Opt into themed (visual style) standard controls. This is a manifest entry, not a link dependency.
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+#else
+// MinGW: the libraries are named on the g++ command line and the manifest is a resource (see MultiPing.rc).
+#endif
 
 // ---------------------------------------------------------------------------------------------
 // Constants
@@ -175,7 +205,7 @@ static bool FontExists(const wchar_t* face)
 {
     LOGFONTW lf; ZeroMemory(&lf, sizeof lf);
     lf.lfCharSet = DEFAULT_CHARSET;
-    wcscpy_s(lf.lfFaceName, face);
+    CopyW(lf.lfFaceName, LF_FACESIZE, face);
     bool found = false;
     HDC dc = GetDC(NULL);
     EnumFontFamiliesExW(dc, &lf, FontFoundProc, (LPARAM)&found, 0);
@@ -283,7 +313,12 @@ static DWORD WINAPI PingThread(LPVOID p)
             QueryPerformanceCounter(&qb);
             if (n > 0) ok = ((ICMPV6_ECHO_REPLY*)reply.data())->Status == IP_SUCCESS;
         }
-        if (ok) result = (LPARAM)((qb.QuadPart - qa.QuadPart) * 1000000 / freq.QuadPart);
+        if (ok) {
+            // Clamp at zero: on some systems (XP in a VM, for one) the counter can run slightly
+            // differently per CPU, and a negative delta must not be mistaken for a RES_* code.
+            LONGLONG us = (qb.QuadPart - qa.QuadPart) * 1000000 / freq.QuadPart;
+            result = us < 0 ? 0 : (LPARAM)us;
+        }
         InterlockedExchange(&c->result, (LONG)result);
         InterlockedExchange(&c->resultSeq, seq);
         InterlockedExchange(&c->ready, 1);
@@ -309,7 +344,7 @@ static void StartPing(Row* r)
     StopPing(r);
     if (r->addr.empty()) return;
     PingCtx* c = new PingCtx;
-    wcsncpy_s(c->host, r->addr.c_str(), _TRUNCATE);
+    CopyW(c->host, sizeof c->host / sizeof c->host[0], r->addr.c_str());
     c->stop = CreateEvent(NULL, TRUE, FALSE, NULL);
     c->go = CreateEvent(NULL, FALSE, FALSE, NULL);
     c->ready = 0;
@@ -370,7 +405,7 @@ static void SaveWindowRect(HWND h)
         GetWindowRect(h, &r);
     }
     char buf[96];
-    int n = sprintf_s(buf, "%ld %ld %ld %ld\r\n", r.left, r.top, r.right - r.left, r.bottom - r.top);
+    int n = FormatA(buf, sizeof buf, "%ld %ld %ld %ld\r\n", r.left, r.top, r.right - r.left, r.bottom - r.top);
     std::wstring path = ConfigDir(true) + L"\\window.txt";
     HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f == INVALID_HANDLE_VALUE) return;
@@ -391,7 +426,7 @@ static bool LoadWindowRect(RECT* out)
     ReadFile(f, buf, sizeof buf - 1, &got, NULL);
     CloseHandle(f);
     long x, y, w, hgt;
-    if (sscanf_s(buf, "%ld %ld %ld %ld", &x, &y, &w, &hgt) != 4) return false;
+    if (sscanf(buf, "%ld %ld %ld %ld", &x, &y, &w, &hgt) != 4) return false;
     if (w < 100 || hgt < 100 || w > 20000 || hgt > 20000) return false;
 
     RECT r = { x, y, x + w, y + hgt };
@@ -510,7 +545,8 @@ static void LogF(const char* fmt, ...)
 {
     char buf[512];
     va_list ap; va_start(ap, fmt);
-    int n = vsprintf_s(buf, fmt, ap);
+    int n = _vsnprintf(buf, sizeof buf, fmt, ap);
+    if (n < 0 || n >= (int)sizeof buf) n = (int)sizeof buf - 1;
     va_end(ap);
     HANDLE f = CreateFileW(L"C:\\devsrc\\mp.log", FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, 0, NULL);
     if (f == INVALID_HANDLE_VALUE) return;
@@ -619,18 +655,18 @@ static void PushRing(Row* r, int v)
 // Formats a millisecond value with precision that suits its magnitude: 0.37, 4.21, 23.5, 187.
 static void FormatMs(double ms, wchar_t* out, size_t n)
 {
-    if (ms < 10.0)       swprintf_s(out, n, L"%.2f", ms);
-    else if (ms < 100.0) swprintf_s(out, n, L"%.1f", ms);
-    else                 swprintf_s(out, n, L"%.0f", ms);
+    if (ms < 10.0)       FormatW(out, n, L"%.2f", ms);
+    else if (ms < 100.0) FormatW(out, n, L"%.1f", ms);
+    else                 FormatW(out, n, L"%.0f", ms);
 }
 
 static void UpdateLabels(Row* r)
 {
     wchar_t b[64], vs[32];
-    if (r->last == RES_NONE)         wcscpy_s(b, L"-");
-    else if (r->last == RES_NOHOST)  wcscpy_s(b, L"no host");
-    else if (r->last == RES_TIMEOUT) wcscpy_s(b, L"timeout");
-    else { FormatMs((double)r->last / 1000.0, vs, 32); swprintf_s(b, L"%s ms", vs); }
+    if (r->last == RES_NONE)         CopyW(b, 64, L"-");
+    else if (r->last == RES_NOHOST)  CopyW(b, 64, L"no host");
+    else if (r->last == RES_TIMEOUT) CopyW(b, 64, L"timeout");
+    else { FormatMs((double)r->last / 1000.0, vs, 32); FormatW(b, 64, L"%ls ms", vs); }
     SetWindowTextW(r->cur, b);
 
     if (r->samples.empty()) {
@@ -857,7 +893,7 @@ static void PaintGraph(HWND h, Row* r)
     // Scale label, top-left.
     wchar_t lbl[32], lv[32];
     FormatMs((double)nice / 1000.0, lv, 32);
-    swprintf_s(lbl, L"%s ms", lv);
+    FormatW(lbl, 32, L"%ls ms", lv);
     HGDIOBJ oldFont = SelectObject(mdc, g_fontSmall);
     SetBkMode(mdc, OPAQUE);                 // white backing keeps the label legible over tall bars
     SetBkColor(mdc, RGB(255, 255, 255));
@@ -1010,8 +1046,10 @@ static bool InitD2D()
     PFN_D2D pD2D = (PFN_D2D)GetProcAddress(hd2d, "D2D1CreateFactory");
     PFN_DW  pDW  = (PFN_DW)GetProcAddress(hdw, "DWriteCreateFactory");
     if (!pD2D || !pDW) return false;
-    if (FAILED(pD2D(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory), NULL, (void**)&g_d2d))) return false;
-    if (FAILED(pDW(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown**)&g_dw))) return false;
+    static const IID iidD2D1Factory  = { 0x06152247, 0x6f50, 0x465a, { 0x92, 0x45, 0x11, 0x8b, 0xfd, 0x3b, 0x60, 0x07 } };
+    static const IID iidDWriteFactory = { 0xb859ee5a, 0xd838, 0x4b5b, { 0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48 } };
+    if (FAILED(pD2D(D2D1_FACTORY_TYPE_SINGLE_THREADED, iidD2D1Factory, NULL, (void**)&g_d2d))) return false;
+    if (FAILED(pDW(DWRITE_FACTORY_TYPE_SHARED, iidDWriteFactory, (IUnknown**)&g_dw))) return false;
     D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
         D2D1_RENDER_TARGET_TYPE_DEFAULT,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
@@ -1097,7 +1135,7 @@ static const wchar_t* BuildInfoText()
     for (int i = 0; i < 12; i++) if (strncmp(months + 3 * i, d, 3) == 0) { mon = i + 1; break; }
     int day = (d[4] == ' ' ? 0 : (d[4] - '0') * 10) + (d[5] - '0');
     int year = atoi(d + 7);
-    swprintf_s(text, L"Build %04d-%02d-%02d from git " WIDE(GIT_REV), year, mon, day);
+    FormatW(text, 96, L"Build %04d-%02d-%02d from git " WIDE(GIT_REV), year, mon, day);
     return text;
 }
 
