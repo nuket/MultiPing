@@ -3,7 +3,7 @@
 A small Win32 tool that pings a list of hosts once a second and shows, per host, the current
 round-trip time, session min / median / avg / max, and a bar graph of the last 60 seconds.
 
-![MultiPing pinging eight hosts, two of them timing out](screenshot.png)
+![MultiPing pinging nine hosts, two of them timing out](screenshot.png)
 
 ## Build
 
