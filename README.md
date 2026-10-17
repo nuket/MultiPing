@@ -1,5 +1,7 @@
 # MultiPing
 
+[![Build](https://github.com/nuket/MultiPing/actions/workflows/build.yml/badge.svg)](https://github.com/nuket/MultiPing/actions/workflows/build.yml)
+
 A small Win32 tool that pings a list of hosts once a second and shows, per host, the current
 round-trip time, session min / median / avg / max, and a bar graph of the last 60 seconds.
 

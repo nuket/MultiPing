@@ -1,6 +1,7 @@
 @echo off
 rem MIT License
 rem
+rem MultiPing
 rem Copyright (c) 2026 Max Vilimpoc
 rem
 rem Permission is hereby granted, free of charge, to any person obtaining a copy
