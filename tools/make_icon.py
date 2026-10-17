@@ -23,7 +23,8 @@
 
 """Renders the waving-hand emoji (U+1F44B) from Segoe UI Emoji into MultiPing.ico.
 
-Each icon size is rasterized directly at that size (not downscaled) so small sizes stay crisp.
+The glyph is rendered once at high resolution, cropped to its visible pixels so it fills the icon
+square, and scaled down to each size.
 Usage: python tools/make_icon.py  (writes MultiPing.ico and tools/icon_preview.png next to it)
 """
 import io
@@ -38,20 +39,33 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "..", "MultiPing.ico")
 
 
-def render(size: int) -> Image.Image:
-    # Pick the largest font size whose glyph fits in the square with a small margin.
+MASTER = 1024   # render size; every icon size is scaled down from this one image
+MARGIN = 0.04   # fraction of the icon left clear around the glyph (Edge/Chrome-style tight fit)
+
+
+def render_master() -> Image.Image:
+    """The glyph at high resolution, cropped to its visible pixels and padded to a square.
+
+    The font's own bounding box includes generous padding, which made the hand sit small in the
+    icon. Cropping to the alpha channel and scaling that to the square fills it the way other
+    app icons do.
+    """
+    font = ImageFont.truetype(FONT, MASTER // 2)
+    canvas = Image.new("RGBA", (MASTER * 2, MASTER * 2), (0, 0, 0, 0))
+    ImageDraw.Draw(canvas).text((MASTER // 2, MASTER // 2), EMOJI, font=font, embedded_color=True)
+    box = canvas.getchannel("A").getbbox()
+    glyph = canvas.crop(box)
+    side = max(glyph.width, glyph.height)
+    square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    square.paste(glyph, ((side - glyph.width) // 2, (side - glyph.height) // 2), glyph)
+    return square
+
+
+def render(master: Image.Image, size: int) -> Image.Image:
+    inner = max(1, round(size * (1 - 2 * MARGIN)))
+    scaled = master.resize((inner, inner), Image.LANCZOS)
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    best = None
-    for pt in range(size, 4, -1):
-        font = ImageFont.truetype(FONT, pt)
-        l, t, r, b = font.getbbox(EMOJI)
-        if r - l <= size - 2 and b - t <= size - 2:
-            best = (font, l, t, r, b)
-            break
-    font, l, t, r, b = best
-    x = (size - (r - l)) // 2 - l
-    y = (size - (b - t)) // 2 - t
-    ImageDraw.Draw(img).text((x, y), EMOJI, font=font, embedded_color=True)
+    img.paste(scaled, ((size - inner) // 2, (size - inner) // 2), scaled)
     return img
 
 
@@ -98,7 +112,8 @@ def write_ico(path: str, frames: list) -> None:
 
 
 def main() -> None:
-    frames = [render(s) for s in SIZES]
+    master = render_master()
+    frames = [render(master, s) for s in SIZES]
     write_ico(OUT, frames)
     # Preview strip for a quick visual check.
     strip = Image.new("RGBA", (sum(SIZES) + 10 * len(SIZES), 256), (240, 240, 240, 255))
