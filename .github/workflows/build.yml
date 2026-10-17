@@ -1,0 +1,49 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed only by the release step on tags
+
+jobs:
+  build:
+    name: MultiPing.exe (x64, Windows 7+)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSINST=%%i
+          if not defined VSINST ( echo Visual Studio with C++ tools not found & exit /b 1 )
+          call "%VSINST%\VC\Auxiliary\Build\vcvars64.bat"
+          call build.bat
+
+      - name: Check imports
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set VSINST=%%i
+          call "%VSINST%\VC\Auxiliary\Build\vcvars64.bat" >nul
+          dumpbin /nologo /dependents MultiPing.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MultiPing
+          path: MultiPing.exe
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" MultiPing.exe --title "MultiPing ${GITHUB_REF_NAME}" --generate-notes \
+            || gh release upload "${GITHUB_REF_NAME}" MultiPing.exe --clobber

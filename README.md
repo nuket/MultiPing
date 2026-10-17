@@ -10,12 +10,12 @@ round-trip time, session min / median / avg / max, and a bar graph of the last 6
 Both are built from the same source and behave identically; every version-dependent feature is resolved
 at runtime. The XP build is the more portable of the two.
 
-| | MultiPingXP.exe | MultiPing64.exe |
+| | MultiPing.exe | MultiPingXP.exe |
 |---|---|---|
-| Architecture | x86 | x64 |
-| Runs on | 32-bit and 64-bit Windows XP SP3 and later | 64-bit Windows 7 SP1 and later |
-| Compiler and CRT | MSVC 14.16, UCRT from 2015 | MSVC 14.44, current UCRT |
-| Size | about 225 KB | about 296 KB |
+| Architecture | x64 | x86 |
+| Runs on | 64-bit Windows 7 SP1 and later | 32-bit and 64-bit Windows XP SP3 and later |
+| Compiler and CRT | MSVC 14.44, current UCRT | MSVC 14.16, UCRT from 2015 |
+| Size | about 296 KB | about 225 KB |
 
 ## Usage
 
@@ -34,7 +34,7 @@ at runtime. The XP build is the more portable of the two.
 
 Run `build.bat` from a normal command prompt (it calls `vcvars64.bat` from VS 2022 Community itself).
 
-Output is `MultiPing64.exe` (64-bit), statically linked against the CRT (`/MT`); its only imports are `user32`, 
+Output is `MultiPing.exe` (64-bit), statically linked against the CRT (`/MT`); its only imports are `user32`, 
 `gdi32`, `kernel32`, `iphlpapi` and `ws2_32`. It requires Windows 7 SP1 or later.
 
 The build script embeds the current git short revision, shown under the copyright at the top right.
