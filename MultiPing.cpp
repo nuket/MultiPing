@@ -18,6 +18,8 @@
 #include <windowsx.h>
 #include <iphlpapi.h>
 #include <icmpapi.h>
+#include <d2d1.h>      // only for interface declarations; d2d1.dll / dwrite.dll are loaded at runtime
+#include <dwrite.h>
 #include <stdio.h>
 #include <string.h>
 #include <string>
@@ -54,6 +56,15 @@ enum { RES_NONE = -3, RES_NOHOST = -2, RES_TIMEOUT = -1 };
 #define FONT_SMALL_PT  9
 #define FONT_LOGO_PT   24     // "MultiPing" title at the top, bold
 #define LOGO_H         44     // height reserved for the title (96-dpi px)
+#define FONT_INFO_PT   10     // copyright / revision block beside the title (under half the title size)
+
+// Git short revision, passed in by build.bat as /DGIT_REV="abc1234".
+#ifndef GIT_REV
+#define GIT_REV "unknown"
+#endif
+#define WIDE2(x) L##x
+#define WIDE(x)  WIDE2(x)
+#define COPYRIGHT_TEXT L"Copyright \x00A9 2026 Max Vilimpoc"
 
 // Layout metrics in 96-dpi pixels.
 #define MARGIN       18     // outer padding around all content
@@ -66,6 +77,7 @@ enum { RES_NONE = -3, RES_NOHOST = -2, RES_TIMEOUT = -1 };
 #define W_STAT       92
 #define W_GRAPH_MIN  240
 #define GRAPH_GAP    28     // extra space between the Max column and the graph
+#define DEL_GAP      10     // extra space between the graph and the delete button
 #define W_DEL        24
 
 enum { C_ADDR, C_CUR, C_MIN, C_MED, C_AVG, C_MAX, C_GRAPH, C_DEL, NCOL };
@@ -107,7 +119,17 @@ struct Row {
 };
 
 static HWND     g_hwnd;
-static HFONT    g_font, g_fontSmall, g_fontLogo, g_fontEmoji;
+static HFONT    g_font, g_fontSmall, g_fontLogo, g_fontEmoji, g_fontInfo;
+
+// Direct2D / DirectWrite, used only to draw the title emoji in color. Loaded on demand; when
+// unavailable the emoji is drawn with GDI in monochrome instead.
+static ID2D1Factory*        g_d2d;
+static IDWriteFactory*      g_dw;
+static ID2D1DCRenderTarget* g_rt;
+static IDWriteTextFormat*   g_emojiFmt;
+static bool                 g_d2dTried;
+static bool InitD2D();
+static bool DrawDeleteD2D(HDC hdc, const RECT& rc, COLORREF circle);
 
 // Emoji appended to the title: U+1F44B (waving hand) as its UTF-16 surrogate pair. Drawn with
 // Segoe UI Emoji, which GDI renders in monochrome outline form.
@@ -391,16 +413,16 @@ static Cols ComputeCols(int clientW)
         c.w[i] = S(g_colBase[i]);
         if (i != C_GRAPH) fixed += c.w[i];
     }
-    int avail = clientW - 2 * S(MARGIN) - (NCOL - 1) * S(GAP) - S(GRAPH_GAP) - fixed;
+    int avail = clientW - 2 * S(MARGIN) - (NCOL - 1) * S(GAP) - S(GRAPH_GAP) - S(DEL_GAP) - fixed;
     if (avail > c.w[C_GRAPH]) c.w[C_GRAPH] = avail;
     c.x[0] = S(MARGIN);
-    for (int i = 1; i < NCOL; i++) c.x[i] = c.x[i - 1] + c.w[i - 1] + S(GAP) + (i == C_GRAPH ? S(GRAPH_GAP) : 0);
+    for (int i = 1; i < NCOL; i++) c.x[i] = c.x[i - 1] + c.w[i - 1] + S(GAP) + (i == C_GRAPH ? S(GRAPH_GAP) : i == C_DEL ? S(DEL_GAP) : 0);
     return c;
 }
 
 static int MinContentWidth()
 {
-    int w = 2 * S(MARGIN) + (NCOL - 1) * S(GAP) + S(GRAPH_GAP);
+    int w = 2 * S(MARGIN) + (NCOL - 1) * S(GAP) + S(GRAPH_GAP) + S(DEL_GAP);
     for (int i = 0; i < NCOL; i++) w += S(g_colBase[i]);
     return w;
 }
@@ -806,24 +828,27 @@ static void PaintDelete(HWND h, DelState* st)
     HGDIOBJ oldBmp = SelectObject(mdc, bmp);
     FillRect(mdc, &rc, GetSysColorBrush(COLOR_BTNFACE));
 
-    int d = (W < H ? W : H);
-    int cx = W / 2, cy = H / 2, rad = d / 2;
     COLORREF col = st->down ? RGB(170, 30, 30) : (st->hover ? RGB(240, 70, 70) : RGB(214, 44, 44));
-    HBRUSH fill = CreateSolidBrush(col);
-    HPEN edge = CreatePen(PS_SOLID, 1, col);
-    HGDIOBJ oldB = SelectObject(mdc, fill), oldP = SelectObject(mdc, edge);
-    Ellipse(mdc, cx - rad, cy - rad, cx + rad, cy + rad);
-    SelectObject(mdc, oldB); SelectObject(mdc, oldP);
-    DeleteObject(fill); DeleteObject(edge);
+    if (!DrawDeleteD2D(mdc, rc, col)) {
+        // GDI fallback (not antialiased).
+        int d = (W < H ? W : H);
+        int cx = W / 2, cy = H / 2, rad = d / 2;
+        HBRUSH fill = CreateSolidBrush(col);
+        HPEN edge = CreatePen(PS_SOLID, 1, col);
+        HGDIOBJ oldB = SelectObject(mdc, fill), oldP = SelectObject(mdc, edge);
+        Ellipse(mdc, cx - rad, cy - rad, cx + rad, cy + rad);
+        SelectObject(mdc, oldB); SelectObject(mdc, oldP);
+        DeleteObject(fill); DeleteObject(edge);
 
-    int thick = d / 9; if (thick < 2) thick = 2;
-    int ins = (int)(rad * 0.45);
-    HPEN xp = CreatePen(PS_SOLID, thick, RGB(255, 255, 255));
-    oldP = SelectObject(mdc, xp);
-    MoveToEx(mdc, cx - ins, cy - ins, NULL); LineTo(mdc, cx + ins + 1, cy + ins + 1);
-    MoveToEx(mdc, cx - ins, cy + ins, NULL); LineTo(mdc, cx + ins + 1, cy - ins - 1);
-    SelectObject(mdc, oldP);
-    DeleteObject(xp);
+        int thick = d / 9; if (thick < 2) thick = 2;
+        int ins = (int)(rad * 0.45);
+        HPEN xp = CreatePen(PS_SOLID, thick, RGB(255, 255, 255));
+        oldP = SelectObject(mdc, xp);
+        MoveToEx(mdc, cx - ins, cy - ins, NULL); LineTo(mdc, cx + ins, cy + ins);
+        MoveToEx(mdc, cx - ins, cy + ins, NULL); LineTo(mdc, cx + ins, cy - ins);
+        SelectObject(mdc, oldP);
+        DeleteObject(xp);
+    }
 
     BitBlt(hdc, 0, 0, W, H, mdc, 0, 0, SRCCOPY);
     SelectObject(mdc, oldBmp);
@@ -887,12 +912,118 @@ static LRESULT CALLBACK DeleteProc(HWND h, UINT m, WPARAM w, LPARAM l)
 // Main window
 // ---------------------------------------------------------------------------------------------
 
+static bool InitD2D()
+{
+    if (g_d2dTried) return g_rt != NULL;
+    g_d2dTried = true;
+    HMODULE hd2d = LoadLibraryW(L"d2d1.dll");
+    HMODULE hdw  = LoadLibraryW(L"dwrite.dll");
+    if (!hd2d || !hdw) return false;
+    typedef HRESULT (WINAPI* PFN_D2D)(D2D1_FACTORY_TYPE, REFIID, const D2D1_FACTORY_OPTIONS*, void**);
+    typedef HRESULT (WINAPI* PFN_DW)(DWRITE_FACTORY_TYPE, REFIID, IUnknown**);
+    PFN_D2D pD2D = (PFN_D2D)GetProcAddress(hd2d, "D2D1CreateFactory");
+    PFN_DW  pDW  = (PFN_DW)GetProcAddress(hdw, "DWriteCreateFactory");
+    if (!pD2D || !pDW) return false;
+    if (FAILED(pD2D(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory), NULL, (void**)&g_d2d))) return false;
+    if (FAILED(pDW(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown**)&g_dw))) return false;
+    D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+        0, 0, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_FEATURE_LEVEL_DEFAULT);
+    if (FAILED(g_d2d->CreateDCRenderTarget(&props, &g_rt))) { g_rt = NULL; return false; }
+    return true;
+}
+
+// Creates the DirectWrite format for the emoji at the title's pixel size (the DC render target
+// works at 96 DPI, so DIPs are pixels here).
+static void CreateEmojiFormat()
+{
+    if (g_emojiFmt) { g_emojiFmt->Release(); g_emojiFmt = NULL; }
+    if (!InitD2D()) return;
+    g_dw->CreateTextFormat(L"Segoe UI Emoji", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                           DWRITE_FONT_STRETCH_NORMAL, (float)MulDiv(FONT_LOGO_PT, (int)g_dpi, 72),
+                           L"en-us", &g_emojiFmt);
+}
+
+// Draws the title emoji in color into `rc` of `hdc`. Returns false if the color path is unavailable.
+static bool DrawColorEmoji(HDC hdc, const RECT& rc)
+{
+    if (!InitD2D() || !g_emojiFmt) return false;
+    if (FAILED(g_rt->BindDC(hdc, &rc))) return false;
+    g_rt->BeginDraw();
+    COLORREF bg = GetSysColor(COLOR_BTNFACE);
+    g_rt->Clear(D2D1::ColorF(GetRValue(bg) / 255.0f, GetGValue(bg) / 255.0f, GetBValue(bg) / 255.0f));
+    ID2D1SolidColorBrush* brush = NULL;
+    g_rt->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Black), &brush);
+    D2D1_RECT_F lr = D2D1::RectF(0, 0, (float)(rc.right - rc.left), (float)(rc.bottom - rc.top));
+    if (brush) {
+        g_rt->DrawText(TITLE_EMOJI, (UINT32)wcslen(TITLE_EMOJI), g_emojiFmt, lr, brush,
+                       D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+        brush->Release();
+    }
+    HRESULT hr = g_rt->EndDraw();
+    if (hr == D2DERR_RECREATE_TARGET) {
+        g_rt->Release(); g_rt = NULL;
+        g_d2dTried = false;             // rebuilt on the next paint
+    }
+    return SUCCEEDED(hr) && brush != NULL;
+}
+
+// Antialiased delete glyph: filled circle with a white X, drawn via Direct2D into `rc` of `hdc`.
+static bool DrawDeleteD2D(HDC hdc, const RECT& rc, COLORREF circle)
+{
+    if (!InitD2D()) return false;
+    if (FAILED(g_rt->BindDC(hdc, &rc))) return false;
+    float W = (float)(rc.right - rc.left), H = (float)(rc.bottom - rc.top);
+    float d = W < H ? W : H;
+    float cx = W / 2.0f, cy = H / 2.0f, rad = d / 2.0f - 0.5f;
+    float thick = d / 9.0f; if (thick < 2.0f) thick = 2.0f;
+    float ins = rad * 0.45f;
+
+    g_rt->BeginDraw();
+    COLORREF bg = GetSysColor(COLOR_BTNFACE);
+    g_rt->Clear(D2D1::ColorF(GetRValue(bg) / 255.0f, GetGValue(bg) / 255.0f, GetBValue(bg) / 255.0f));
+    ID2D1SolidColorBrush* red = NULL; ID2D1SolidColorBrush* white = NULL;
+    g_rt->CreateSolidColorBrush(D2D1::ColorF(GetRValue(circle) / 255.0f, GetGValue(circle) / 255.0f, GetBValue(circle) / 255.0f), &red);
+    g_rt->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), &white);
+    if (red && white) {
+        g_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), rad, rad), red);
+        g_rt->DrawLine(D2D1::Point2F(cx - ins, cy - ins), D2D1::Point2F(cx + ins, cy + ins), white, thick);
+        g_rt->DrawLine(D2D1::Point2F(cx - ins, cy + ins), D2D1::Point2F(cx + ins, cy - ins), white, thick);
+    }
+    if (red) red->Release();
+    if (white) white->Release();
+    HRESULT hr = g_rt->EndDraw();
+    if (hr == D2DERR_RECREATE_TARGET) { g_rt->Release(); g_rt = NULL; g_d2dTried = false; }
+    return SUCCEEDED(hr) && red && white;
+}
+
+// "Build 2026-10-17 from git abc1234", with the compiler's "Mmm dd yyyy" date turned into ISO form.
+static const wchar_t* BuildInfoText()
+{
+    static wchar_t text[96];
+    if (text[0]) return text;
+    const char* d = __DATE__;
+    static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    int mon = 0;
+    for (int i = 0; i < 12; i++) if (strncmp(months + 3 * i, d, 3) == 0) { mon = i + 1; break; }
+    int day = (d[4] == ' ' ? 0 : (d[4] - '0') * 10) + (d[5] - '0');
+    int year = atoi(d + 7);
+    swprintf_s(text, L"Build %04d-%02d-%02d from git " WIDE(GIT_REV), year, mon, day);
+    return text;
+}
+
 static void CreateFonts()
 {
     if (g_font) DeleteObject(g_font);
     if (g_fontSmall) DeleteObject(g_fontSmall);
     if (g_fontLogo) DeleteObject(g_fontLogo);
     if (g_fontEmoji) DeleteObject(g_fontEmoji);
+    if (g_fontInfo) DeleteObject(g_fontInfo);
+    g_fontInfo = CreateFontW(-MulDiv(FONT_INFO_PT, (int)g_dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    CreateEmojiFormat();
     g_fontLogo = CreateFontW(-MulDiv(FONT_LOGO_PT, (int)g_dpi, 72), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                              DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
@@ -929,9 +1060,23 @@ static void PaintMain(HWND h)
     RECT lr = { c.x[0], LogoTop(), rc.right, LogoTop() + S(LOGO_H) };
     DrawTextW(hdc, L"MultiPing", -1, &lr, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
     SIZE ts; GetTextExtentPoint32W(hdc, L"MultiPing", 9, &ts);
-    SelectObject(hdc, g_fontEmoji);
     lr.left += ts.cx + S(10);
-    DrawTextW(hdc, TITLE_EMOJI, -1, &lr, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
+    RECT er = { lr.left, lr.top, lr.left + S(LOGO_H) * 3 / 2, lr.bottom };
+    if (!DrawColorEmoji(hdc, er)) {
+        SelectObject(hdc, g_fontEmoji);   // monochrome fallback
+        DrawTextW(hdc, TITLE_EMOJI, -1, &lr, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
+    }
+
+    // Copyright and revision, stacked, right-aligned to the window margin beside the title.
+    SelectObject(hdc, g_fontInfo);
+    SetTextColor(hdc, RGB(80, 80, 80));
+    TEXTMETRICW tm; GetTextMetricsW(hdc, &tm);
+    int iy = LogoTop() + (S(LOGO_H) - 2 * tm.tmHeight) / 2;
+    RECT ir = { er.right, iy, rc.right - S(MARGIN), iy + tm.tmHeight };
+    DrawTextW(hdc, COPYRIGHT_TEXT, -1, &ir, DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+    ir.top += tm.tmHeight; ir.bottom += tm.tmHeight;
+    DrawTextW(hdc, BuildInfoText(), -1, &ir, DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+    SetTextColor(hdc, GetSysColor(COLOR_BTNTEXT));
 
     SelectObject(hdc, g_font);
     int y = HeaderTop();
@@ -991,7 +1136,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_GETMINMAXINFO: {
         MINMAXINFO* mmi = (MINMAXINFO*)l;
-        RECT r = { 0, 0, MinContentWidth() + GetSystemMetrics(SM_CXVSCROLL), S(ROW_H) * 2 + RowsTop() };
+        RECT r = { 0, 0, MinContentWidth() + GetSystemMetrics(SM_CXVSCROLL), ContentHeightFor(2) };
         AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, FALSE, 0);
         mmi->ptMinTrackSize.x = r.right - r.left;
         mmi->ptMinTrackSize.y = r.bottom - r.top;

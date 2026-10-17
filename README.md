@@ -10,6 +10,7 @@ round-trip time, session min / median / avg / max, and a bar graph of the last 6
 Run `build.bat` from a normal command prompt (it calls `vcvars64.bat` from VS 2022 Community itself).
 Output is `MultiPing.exe`, statically linked against the CRT (`/MT`); its only imports are
 `user32`, `gdi32`, `kernel32`, `iphlpapi` and `ws2_32`.
+The build script embeds the current git short revision, shown under the copyright at the top right.
 
 ## Usage
 
