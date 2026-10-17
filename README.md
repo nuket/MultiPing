@@ -52,9 +52,5 @@ libstdc++). It looks for MSYS2 in `%MSYS2_ROOT%`, then `%LOCALAPPDATA%\msys64` (
 `C:\msys64` (machine-wide, as on GitHub's `windows-latest` runner); the package it needs is
 `mingw-w64-i686-gcc`. The manifest for themed controls comes from `MultiPing.manifest` via the resource file.
 
-`build_xp.bat` is the alternative MSVC route to the same executable. It needs the deprecated "C++ Windows XP
-Support for VS 2017 (v141) tools" component of Visual Studio 2022, which brings the MSVC 14.16 toolset, the
-Windows 7.1A SDK and the UCRT from SDK 10.0.10240.0 (the last one that runs on XP).
-
 On XP, the app uses Tahoma instead of Segoe UI, shows the app icon beside the title instead of the emoji (no emoji
 font), and draws the delete button without antialiasing (no Direct2D). Everything else works the same. 
