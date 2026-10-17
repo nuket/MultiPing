@@ -53,7 +53,7 @@ enum { RES_NONE = -3, RES_NOHOST = -2, RES_TIMEOUT = -1 };
 #define FONT_PT        14
 #define FONT_SMALL_PT  9
 #define FONT_LOGO_PT   24     // "MultiPing" title at the top, bold
-#define LOGO_H         38     // height reserved for the title (96-dpi px)
+#define LOGO_H         44     // height reserved for the title (96-dpi px)
 
 // Layout metrics in 96-dpi pixels.
 #define MARGIN       18     // outer padding around all content
@@ -107,9 +107,15 @@ struct Row {
 };
 
 static HWND     g_hwnd;
-static HFONT    g_font, g_fontSmall, g_fontLogo;
+static HFONT    g_font, g_fontSmall, g_fontLogo, g_fontEmoji;
+
+// Emoji appended to the title: U+1F44B (waving hand) as its UTF-16 surrogate pair. Drawn with
+// Segoe UI Emoji, which GDI renders in monochrome outline form.
+#ifndef TITLE_EMOJI
+#define TITLE_EMOJI L"\xD83D\xDC4B"
+#endif
 static UINT     g_dpi = 96;
-static int      g_scrollY;
+static int      g_firstRow;     // index of the first visible row (row-based scrolling)
 static int      g_nextRowId = 1;
 static bool     g_closing;
 static std::vector<Row*> g_rows;
@@ -400,28 +406,39 @@ static int MinContentWidth()
 }
 
 static int LogoTop()    { return S(MARGIN) / 2; }
-static int HeaderTop()  { return S(MARGIN) + S(LOGO_H); }
+static int HeaderTop()  { return LogoTop() + S(LOGO_H) + S(2); }
 static int RowsTop()    { return HeaderTop() + S(HDR_H) + S(MARGIN) / 2; }
-static int RowTop(size_t i) { return RowsTop() + (int)i * S(ROW_H); }
 static int ContentHeightFor(int rows) { return RowsTop() + rows * S(ROW_H) + S(MARGIN); }
-static int ContentHeight() { return ContentHeightFor((int)g_rows.size()); }
+
+// Scrolling is by whole rows: the title and header stay put, rows g_firstRow .. g_firstRow+fit-1
+// are shown, and any row that would not fit completely is hidden rather than drawn partially.
+
+static int RowsThatFit()
+{
+    RECT rc; GetClientRect(g_hwnd, &rc);
+    int fit = (rc.bottom - RowsTop()) / S(ROW_H);
+    return fit < 1 ? 1 : fit;
+}
 
 static void Layout()
 {
     RECT rc; GetClientRect(g_hwnd, &rc);
     Cols c = ComputeCols(rc.right);
     int ch = S(CTRL_H);
+    int fit = RowsThatFit();
     HDWP dwp = BeginDeferWindowPos((int)g_rows.size() * 8);
     for (size_t i = 0; i < g_rows.size(); i++) {
         Row* r = g_rows[i];
-        int y = RowTop(i) - g_scrollY;
+        bool shown = (int)i >= g_firstRow && (int)i < g_firstRow + fit;
+        int y = RowsTop() + ((int)i - g_firstRow) * S(ROW_H);
         int yc = y + (S(ROW_H) - ch) / 2;
+        UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | (shown ? SWP_SHOWWINDOW : SWP_HIDEWINDOW);
         HWND ctl[NCOL] = { r->edit, r->cur, r->mn, r->med, r->avg, r->mx, r->graph, r->del };
         for (int k = 0; k < NCOL; k++) {
             int cy = yc, chh = ch;
             if (k == C_GRAPH) { cy = y + S(3); chh = S(ROW_H) - S(6); }
             if (k == C_DEL)   { cy = y + (S(ROW_H) - c.w[C_DEL]) / 2; chh = c.w[C_DEL]; }
-            dwp = DeferWindowPos(dwp, ctl[k], NULL, c.x[k], cy, c.w[k], chh, SWP_NOZORDER | SWP_NOACTIVATE);
+            dwp = DeferWindowPos(dwp, ctl[k], NULL, c.x[k], cy, c.w[k], chh, flags);
         }
     }
     EndDeferWindowPos(dwp);
@@ -430,34 +447,36 @@ static void Layout()
 
 static void UpdateScroll()
 {
-    RECT rc; GetClientRect(g_hwnd, &rc);
+    int fit = RowsThatFit(), n = (int)g_rows.size();
+    int maxFirst = n > fit ? n - fit : 0;
+    if (g_firstRow > maxFirst) g_firstRow = maxFirst;
+    if (g_firstRow < 0) g_firstRow = 0;
     SCROLLINFO si = { sizeof si };
     si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
     si.nMin = 0;
-    si.nMax = ContentHeight() - 1;
-    si.nPage = rc.bottom;
-    si.nPos = g_scrollY;
-    SetScrollInfo(g_hwnd, SB_VERT, &si, TRUE);
-    GetScrollInfo(g_hwnd, SB_VERT, &si);
-    if (si.nPos != g_scrollY) { g_scrollY = si.nPos; Layout(); }
+    si.nMax = n - 1;
+    si.nPage = fit;
+    si.nPos = g_firstRow;
+    SetScrollInfo(g_hwnd, SB_VERT, &si, TRUE);   // hides the bar when everything fits
 }
 
-static void SetScrollY(int y)
+static void SetFirstRow(int first)
 {
-    SCROLLINFO si = { sizeof si };
-    si.fMask = SIF_POS;
-    si.nPos = y;
-    SetScrollInfo(g_hwnd, SB_VERT, &si, TRUE);
-    GetScrollInfo(g_hwnd, SB_VERT, &si);
-    if (si.nPos != g_scrollY) { g_scrollY = si.nPos; Layout(); }
+    int fit = RowsThatFit(), n = (int)g_rows.size();
+    int maxFirst = n > fit ? n - fit : 0;
+    if (first > maxFirst) first = maxFirst;
+    if (first < 0) first = 0;
+    if (first == g_firstRow) return;
+    g_firstRow = first;
+    UpdateScroll();
+    Layout();
 }
 
 static void EnsureRowVisible(size_t i)
 {
-    RECT rc; GetClientRect(g_hwnd, &rc);
-    int top = RowTop(i), bottom = top + S(ROW_H);
-    if (top - g_scrollY < 0) SetScrollY(i == 0 ? 0 : top - S(MARGIN));
-    else if (bottom - g_scrollY > rc.bottom) SetScrollY(bottom + S(MARGIN) - rc.bottom);
+    int fit = RowsThatFit();
+    if ((int)i < g_firstRow) SetFirstRow((int)i);
+    else if ((int)i >= g_firstRow + fit) SetFirstRow((int)i - fit + 1);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -873,9 +892,13 @@ static void CreateFonts()
     if (g_font) DeleteObject(g_font);
     if (g_fontSmall) DeleteObject(g_fontSmall);
     if (g_fontLogo) DeleteObject(g_fontLogo);
+    if (g_fontEmoji) DeleteObject(g_fontEmoji);
     g_fontLogo = CreateFontW(-MulDiv(FONT_LOGO_PT, (int)g_dpi, 72), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                              DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    g_fontEmoji = CreateFontW(-MulDiv(FONT_LOGO_PT, (int)g_dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                              DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Emoji");
     g_font = CreateFontW(-MulDiv(FONT_PT, (int)g_dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                          DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
@@ -903,11 +926,15 @@ static void PaintMain(HWND h)
 
     // Title, large and bold, aligned with the Address column.
     HGDIOBJ oldFont = SelectObject(hdc, g_fontLogo);
-    RECT lr = { c.x[0], LogoTop() - g_scrollY, rc.right, LogoTop() - g_scrollY + S(LOGO_H) };
-    DrawTextW(hdc, L"MultiPing", -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    RECT lr = { c.x[0], LogoTop(), rc.right, LogoTop() + S(LOGO_H) };
+    DrawTextW(hdc, L"MultiPing", -1, &lr, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
+    SIZE ts; GetTextExtentPoint32W(hdc, L"MultiPing", 9, &ts);
+    SelectObject(hdc, g_fontEmoji);
+    lr.left += ts.cx + S(10);
+    DrawTextW(hdc, TITLE_EMOJI, -1, &lr, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
 
     SelectObject(hdc, g_font);
-    int y = HeaderTop() - g_scrollY;
+    int y = HeaderTop();
     for (int k = 0; k < NCOL; k++) {
         RECT r = { c.x[k], y, c.x[k] + c.w[k], y + S(HDR_H) };
         UINT align = (k == C_ADDR || k == C_GRAPH) ? DT_LEFT : DT_RIGHT;
@@ -931,8 +958,8 @@ static void OnVScroll(WPARAM w)
     GetScrollInfo(g_hwnd, SB_VERT, &si);
     int pos = si.nPos;
     switch (LOWORD(w)) {
-    case SB_LINEUP:        pos -= S(ROW_H) / 2; break;
-    case SB_LINEDOWN:      pos += S(ROW_H) / 2; break;
+    case SB_LINEUP:        pos -= 1; break;
+    case SB_LINEDOWN:      pos += 1; break;
     case SB_PAGEUP:        pos -= (int)si.nPage; break;
     case SB_PAGEDOWN:      pos += (int)si.nPage; break;
     case SB_THUMBTRACK:
@@ -941,7 +968,7 @@ static void OnVScroll(WPARAM w)
     case SB_BOTTOM:        pos = si.nMax; break;
     default: return;
     }
-    SetScrollY(pos);
+    SetFirstRow(pos);
 }
 
 static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -982,7 +1009,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_MOUSEWHEEL: {
         int delta = GET_WHEEL_DELTA_WPARAM(w);
-        SetScrollY(g_scrollY - delta * S(ROW_H) / WHEEL_DELTA);
+        SetFirstRow(g_firstRow - delta / WHEEL_DELTA);
         return 0;
     }
     case WM_SETFOCUS:
