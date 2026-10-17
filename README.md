@@ -5,24 +5,17 @@ round-trip time, session min / median / avg / max, and a bar graph of the last 6
 
 ![MultiPing pinging nine hosts, two of them timing out](screenshot.png)
 
-## Build
+## Which executable?
 
-Run `build.bat` from a normal command prompt (it calls `vcvars64.bat` from VS 2022 Community itself).
-Output is `MultiPing.exe`, statically linked against the CRT (`/MT`); its only imports are
-`user32`, `gdi32`, `kernel32`, `iphlpapi` and `ws2_32`.
-The build script embeds the current git short revision, shown under the copyright at the top right.
-The application icon (`MultiPing.ico`) is generated from the Segoe UI Emoji waving hand by
-`tools/make_icon.py` (needs Python with Pillow) and embedded via `MultiPing.rc`.
+Both are built from the same source and behave identically; every version-dependent feature is resolved
+at runtime. The XP build is the more portable of the two.
 
-## Windows XP build
-
-`build_xp.bat` produces `MultiPingXP.exe`, a 32-bit build that runs on Windows XP SP3 and later. It needs
-the "C++ Windows XP Support for VS 2017 (v141) tools" component of Visual Studio 2022, which brings the
-MSVC 14.16 toolset, the Windows 7.1A SDK and the UCRT from SDK 10.0.10240.0 (the last one that runs on XP).
-
-On XP the app uses Tahoma instead of Segoe UI, skips the title emoji (no emoji font), and draws the delete
-button without antialiasing (no Direct2D). Everything else works the same. The regular `MultiPing.exe`
-requires Windows 7 SP1 or later.
+| | MultiPingXP.exe | MultiPing64.exe |
+|---|---|---|
+| Architecture | x86 | x64 |
+| Runs on | 32-bit and 64-bit Windows XP SP3 and later | 64-bit Windows 7 SP1 and later |
+| Compiler and CRT | MSVC 14.16, UCRT from 2015 | MSVC 14.44, current UCRT |
+| Size | about 225 KB | about 296 KB |
 
 ## Usage
 
@@ -37,3 +30,23 @@ requires Windows 7 SP1 or later.
 - The window size and position are saved to `window.txt` in the same folder and restored on the next
   start, clamped to the current screen if the display layout has changed.
 
+## Modern Build
+
+Run `build.bat` from a normal command prompt (it calls `vcvars64.bat` from VS 2022 Community itself).
+
+Output is `MultiPing64.exe` (64-bit), statically linked against the CRT (`/MT`); its only imports are `user32`, 
+`gdi32`, `kernel32`, `iphlpapi` and `ws2_32`. It requires Windows 7 SP1 or later.
+
+The build script embeds the current git short revision, shown under the copyright at the top right.
+
+The application icon (`MultiPing.ico`) is generated from the Segoe UI Emoji waving hand by
+`tools/make_icon.py` (needs Python with Pillow) and embedded via `MultiPing.rc`.
+
+## Windows XP build
+
+`build_xp.bat` produces `MultiPingXP.exe`, a 32-bit build that runs on Windows XP SP3 and later. It needs
+the "C++ Windows XP Support for VS 2017 (v141) tools" component of Visual Studio 2022, which brings the
+MSVC 14.16 toolset, the Windows 7.1A SDK and the UCRT from SDK 10.0.10240.0 (the last one that runs on XP).
+
+On XP, the app uses Tahoma instead of Segoe UI, shows the app icon beside the title instead of the emoji (no emoji
+font), and draws the delete button without antialiasing (no Direct2D). Everything else works the same. 
