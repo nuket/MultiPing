@@ -4,6 +4,6 @@
 *.pdb
 *.ilk
 *.res
-*.manifest
+MultiPing.exe.manifest
 tools/icon_preview.png
 __pycache__/
