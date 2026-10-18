@@ -15,7 +15,7 @@ jobs:
     name: MultiPing.exe (x64, Windows 7+, MSVC)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build
         shell: cmd
@@ -33,7 +33,7 @@ jobs:
           dumpbin /nologo /dependents MultiPing.exe
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: MultiPing
           path: MultiPing.exe
@@ -54,7 +54,7 @@ jobs:
     name: MultiPingXP.exe (x86, Windows XP+, MinGW-w64)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The runner's MSYS2 lives in C:\msys64, which build_mingw.bat finds on its own. Only the
       # 32-bit (i686, msvcrt) GCC has to be added; it is the environment that can still target XP.
@@ -78,7 +78,7 @@ jobs:
           dumpbin /nologo /dependents MultiPingXP.exe
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: MultiPingXP
           path: MultiPingXP.exe
