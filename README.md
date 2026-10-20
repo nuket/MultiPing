@@ -2,22 +2,31 @@
 
 [![Build](https://github.com/nuket/MultiPing/actions/workflows/build.yml/badge.svg)](https://github.com/nuket/MultiPing/actions/workflows/build.yml)
 
-A small Win32 tool that pings a list of hosts once a second and shows, per host, the current
+A small tool that pings a list of hosts once a second and shows, per host, the current
 round-trip time, session min / median / avg / max, and a bar graph of the last 60 seconds.
 
-![MultiPing pinging eight LAN hosts and one internet host, one of them timing out](screenshot.png)
+It runs on Windows (XP SP3 and later), macOS (11 and later) and Linux (GTK 3, Qt 5 or Qt 6),
+with the same look everywhere and no extra dependencies.
 
-## Which executable?
+<p align="center">
+  <img src="screenshots/carousel.webp" width="100%"
+       alt="MultiPing on Windows XP, 10 and 11, macOS, Ubuntu with GTK 3, and Kubuntu 24.04 and 26.04 with Qt 5 and Qt 6, in light and dark mode">
+</p>
 
-Both are built from the same source and behave identically; every version-dependent feature is resolved
-at runtime. The XP build is the more portable of the two.
+## Which program?
 
-| | MultiPing.exe | MultiPingXP.exe |
-|---|---|---|
-| Architecture | x64 | x86 |
-| Runs on | 64-bit Windows 7 SP1 and later | 32-bit and 64-bit Windows XP SP3 and later |
-| Compiler and CRT | MSVC 14.44, current UCRT | MinGW-w64 GCC (MSYS2 mingw32), msvcrt.dll |
-| Size | about 296 KB | about 477 KB |
+| | Runs on | Built with | Size |
+|---|---|---|---|
+| `MultiPing.exe` | 64-bit Windows 7 SP1 and later | MSVC 14.44, current UCRT, static | about 303 KB |
+| `MultiPingXP.exe` | 32- and 64-bit Windows XP SP3 and later | MinGW-w64 GCC (MSYS2 mingw32), msvcrt.dll | about 505 KB |
+| `multiping-gtk` | Linux with GTK 3: Debian 12, Ubuntu 24.04 and later | g++ in Debian bookworm | about 152 KB |
+| `multiping-qt5` | Linux with Qt 5.15 | g++ in Debian bookworm | about 168 KB |
+| `multiping-qt6` | Linux with Qt 6.4 or later | g++ in Debian bookworm | about 172 KB |
+| `MultiPing.app` | macOS 11 and later, Apple silicon and Intel | Apple clang, AppKit | about 360 KB |
+
+The two Windows builds behave identically; every version-dependent feature is resolved at runtime,
+and the XP build is the more portable of the two. On Linux, pick the kit the desktop uses: GTK on
+GNOME, Qt on KDE.
 
 ## Usage
 
@@ -28,17 +37,33 @@ at runtime. The XP build is the more portable of the two.
 - Stats (min / median / avg / max) cover the whole session for that address; the graph shows the last 60 pings,
   one per second, with timeouts drawn in red.
 - The window opens sized for 8 rows; a scrollbar appears only when there are more.
-- Addresses are saved to `%APPDATA%\MultiPing\addresses.txt` on every change and on exit.
+- Addresses are saved to `addresses.txt` on every change and on exit, in `%APPDATA%\MultiPing` on Windows,
+  `~/.config/MultiPing` on Linux and `~/Library/Application Support/MultiPing` on macOS.
 - The window size and position are saved to `window.txt` in the same folder and restored on the next
-  start, clamped to the current screen if the display layout has changed.
+  start, clamped to the current screen if the display layout has changed. Under Wayland only the size is
+  restored, as the window system places windows itself.
+- The window follows the system's light or dark mode, also when it changes while the window is open: the
+  app mode on Windows 10 1809 and later, the appearance on macOS, and the GTK or Qt theme on Linux.
 
-## Modern Build
+Pinging needs no privileges. 
 
-`build.bat` produces `MultiPing.exe`, a 64-bit build that requires Windows 7 SP1 or later,
+On Linux, it uses ICMP datagram sockets where `net.ipv4.ping_group_range`
+allows them (systemd's default), and runs the system's `ping` where it does not (Ubuntu 24.04). 
+
+On macOS, the first start asks for Local Network access, which pinging hosts on the LAN needs.
+
+## Building
+
+**Windows**: `build.bat` produces `MultiPing.exe`, a 64-bit build that requires Windows 7 SP1 or later,
 statically linked against the C Runtime; its only imports are `user32`, `gdi32`, `kernel32`, `iphlpapi` and `ws2_32`.
-
-## Windows XP build
-
 `build_mingw.bat` produces `MultiPingXP.exe`, a 32-bit build that runs on Windows XP SP3 and later, using
 MinGW-w64 GCC from MSYS2's `mingw32` environment (i686, linked against `msvcrt.dll`, static libgcc and
 libstdc++).
+
+**Linux**: `build_linux.sh` produces `multiping-gtk`, `multiping-qt5` and `multiping-qt6` in Docker's
+Debian bookworm (`build_linux.Dockerfile`, built on first use), so they need nothing newer than glibc 2.36,
+GTK 3.24, Qt 5.15 and Qt 6.4. `build_linux.sh --native` builds with the machine's own g++ for whichever of
+GTK 3, Qt 5 and Qt 6 `pkg-config` finds.
+
+**macOS**: `build_macos.sh` produces `MultiPing.app`, a universal (arm64 and x86_64) app with the Xcode
+command line tools, ad-hoc signed.
