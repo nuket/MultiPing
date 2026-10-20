@@ -52,6 +52,11 @@ allows them (systemd's default), and runs the system's `ping` where it does not 
 
 On macOS, the first start asks for Local Network access, which pinging hosts on the LAN needs.
 
+`MultiPing.app` is ad-hoc signed but not notarized, so macOS refuses to open a downloaded copy the first
+time. Allow it with Open Anyway under System Settings › Privacy & Security (on macOS 14 and earlier,
+Control-click the app and choose Open), or clear its quarantine flag in Terminal:
+`xattr -dr com.apple.quarantine MultiPing.app`.
+
 ## Building
 
 **Windows**: `build.bat` produces `MultiPing.exe`, a 64-bit build that requires Windows 7 SP1 or later,
