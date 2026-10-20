@@ -45,6 +45,9 @@ set PATH=%SDK71%\Bin;%PATH%
 
 set GIT_REV=unknown
 for /f "usebackq delims=" %%r in (`git rev-parse --short HEAD 2^>nul`) do set GIT_REV=%%r
+rem MULTIPING_GIT_REVISION when the caller knows it: systems-build.py, building a tree synced
+rem without its .git.
+if defined MULTIPING_GIT_REVISION set "GIT_REV=%MULTIPING_GIT_REVISION%"
 
 rc /nologo /fo MultiPingXP.res MultiPing.rc
 if errorlevel 1 exit /b 1

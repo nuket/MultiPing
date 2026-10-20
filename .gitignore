@@ -7,3 +7,10 @@
 MultiPing.exe.manifest
 tools/icon_preview.png
 __pycache__/
+# Linux and macOS builds
+multiping-gtk
+multiping-qt5
+multiping-qt6
+MultiPing.app/
+# What systems-build.py fetches from the build systems
+artifacts/

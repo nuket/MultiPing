@@ -23,6 +23,7 @@
 
 // MultiPing - pings a list of addresses, one row per address, with live stats and a 60 s graph.
 // Pure Win32 (user32/gdi32) + iphlpapi for ICMP + ws2_32 for name resolution. No comctl32, no MFC.
+// What the front ends share (timing, layout, statistics, the graph, the files) is in MultiPingCore.h.
 // Build: see build.bat (cl /MT ... statically linked CRT).
 
 #ifndef UNICODE
@@ -32,7 +33,7 @@
 #define _UNICODE
 #endif
 #define WIN32_LEAN_AND_MEAN
-#define _CRT_SECURE_NO_WARNINGS   // _vsnwprintf / _vsnprintf are used on purpose (portable to MinGW)
+#define _CRT_SECURE_NO_WARNINGS   // sscanf (MultiPingCore.h) and _vsnprintf (the debug log) are used on purpose
 #define NOMINMAX
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0601   // build_xp.bat overrides this with 0x0502
@@ -52,30 +53,17 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include "MultiPingCore.h"
 
-// Small portable replacements for the MSVC-only secure-CRT templates, so the same source builds
-// with MSVC and with MinGW-w64 GCC. Both always NUL-terminate.
+using namespace mp;
+
+// A small portable replacement for the MSVC-only secure-CRT wcscpy_s, so the same source builds
+// with MSVC and with MinGW-w64 GCC. Always NUL-terminates.
 static void CopyW(wchar_t* dst, size_t n, const wchar_t* src)
 {
     size_t i = 0;
     for (; i + 1 < n && src[i]; i++) dst[i] = src[i];
     dst[i] = 0;
-}
-static int FormatW(wchar_t* buf, size_t n, const wchar_t* fmt, ...)
-{
-    va_list ap; va_start(ap, fmt);
-    int r = _vsnwprintf(buf, n, fmt, ap);
-    va_end(ap);
-    if (r < 0 || (size_t)r >= n) { buf[n - 1] = 0; r = (int)wcslen(buf); }
-    return r;
-}
-static int FormatA(char* buf, size_t n, const char* fmt, ...)
-{
-    va_list ap; va_start(ap, fmt);
-    int r = _vsnprintf(buf, n, fmt, ap);
-    va_end(ap);
-    if (r < 0 || (size_t)r >= n) { buf[n - 1] = 0; r = (int)strlen(buf); }
-    return r;
 }
 
 #ifdef _MSC_VER
@@ -100,45 +88,12 @@ enum {
     WM_APP_DELETE,              // wParam = row id
 };
 
-enum { RES_NONE = -3, RES_NOHOST = -2, RES_TIMEOUT = -1 };
-
-#define RING_N            60     // seconds of history shown in the graph
 #define TIMER_TICK        1
-#define PING_INTERVAL_MS  1000   // UI tick: commits last results and releases the next round of pings
-#define PING_TIMEOUT_MS   800    // under the interval; a result not back by the tick counts as a timeout
-
-// Fonts in points.
-#define FONT_PT        14
-#define FONT_SMALL_PT  9
-#define FONT_LOGO_PT   24     // "MultiPing" title at the top, bold
-#define LOGO_H         44     // height reserved for the title (96-dpi px)
-#define FONT_INFO_PT   10     // copyright / revision block beside the title (under half the title size)
 
 // Git short revision, passed in by build.bat as /DGIT_REV="abc1234".
 #ifndef GIT_REV
 #define GIT_REV "unknown"
 #endif
-#define WIDE2(x) L##x
-#define WIDE(x)  WIDE2(x)
-#define COPYRIGHT_TEXT L"Copyright \x00A9 2026 Max Vilimpoc"
-
-// Layout metrics in 96-dpi pixels.
-#define MARGIN       18     // outer padding around all content
-#define GAP          6
-#define ROW_H        56
-#define HDR_H        30
-#define CTRL_H       32
-#define W_ADDR       290
-#define W_CUR        110
-#define W_STAT       92
-#define W_GRAPH_MIN  240
-#define GRAPH_GAP    28     // extra space between the Max column and the graph
-#define DEL_GAP      10     // extra space between the graph and the delete button
-#define W_DEL        24
-
-enum { C_ADDR, C_CUR, C_MIN, C_MED, C_AVG, C_MAX, C_GRAPH, C_DEL, NCOL };
-static const int g_colBase[NCOL] = { W_ADDR, W_CUR, W_STAT, W_STAT, W_STAT, W_STAT, W_GRAPH_MIN, W_DEL };
-static const wchar_t* g_colNames[NCOL] = { L"Address", L"Current", L"Min", L"Median", L"Avg", L"Max", L"Last 60 s", L"" };
 
 #ifndef EM_SETCUEBANNER
 #define EM_SETCUEBANNER 0x1501   // from commctrl.h, avoids including it
@@ -170,16 +125,12 @@ struct Row {
     std::wstring  addr;
     HWND          edit, cur, mn, med, avg, mx, graph, del;
     PingCtx*      ctx;
-    std::vector<double> samples;    // all successful RTTs this session
-    int           ring[RING_N];     // last RING_N results: >=0 rtt, -1 timeout
-    int           ringCount, ringHead;
-    LPARAM        last;
+    Stats         stats;
 };
 
 static HWND     g_hwnd;
 static HFONT    g_font, g_fontSmall, g_fontLogo, g_fontEmoji, g_fontInfo;
 static HICON    g_titleIcon;      // app icon drawn beside the title where no emoji font exists (XP)
-#define TITLE_ICON_PX 36          // 96-dpi px
 
 // Direct2D / DirectWrite, used only to draw the title emoji in color. Loaded on demand; when
 // unavailable the emoji is drawn with GDI in monochrome instead.
@@ -232,7 +183,102 @@ static std::vector<Row*> g_rows;
 static WNDPROC  g_oldEditProc;
 static UINT (WINAPI* g_pGetDpiForWindow)(HWND);
 
-static int S(int v) { return MulDiv(v, (int)g_dpi, 96); }
+static Metrics Mx() { return Metrics((int)g_dpi); }
+static int S(int v) { return Mx().S(v); }
+static COLORREF Colour(const Rgb& c) { return RGB(c.r, c.g, c.b); }
+
+// ---------------------------------------------------------------------------------------------
+// Light and dark
+// ---------------------------------------------------------------------------------------------
+
+// Windows 10 1809 and later have a dark app mode, which the classic controls ignore: in it the
+// window paints its own background and text, and gives the address boxes and the scroll bar the
+// system's dark control themes. It follows the app mode only where DWM can make the title bar dark
+// too; elsewhere (XP to Windows 10 1803) it stays light. Advapi32, dwmapi and uxtheme are loaded
+// at runtime, keeping them out of the import table.
+static bool   g_dark;
+static bool   g_darkEver;   // dark has been applied, so going light must undo the control themes
+static HBRUSH g_darkFace, g_darkField;
+static const Rgb kDarkFace = { 32, 32, 32 }, kDarkText = { 255, 255, 255 };   // Windows 11's own dark windows
+
+static const Palette& Pal() { return PaletteFor(g_dark); }
+static COLORREF Face()      { return g_dark ? Colour(kDarkFace) : GetSysColor(COLOR_BTNFACE); }
+static COLORREF Ink()       { return g_dark ? Colour(kDarkText) : GetSysColor(COLOR_BTNTEXT); }
+static HBRUSH   FaceBrush() { return g_dark ? g_darkFace : GetSysColorBrush(COLOR_BTNFACE); }
+
+static bool AppsUseDarkTheme()
+{
+    typedef LONG (WINAPI* PFN_ROKE)(HKEY, LPCWSTR, DWORD, REGSAM, PHKEY);
+    typedef LONG (WINAPI* PFN_RQVE)(HKEY, LPCWSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
+    typedef LONG (WINAPI* PFN_RCK)(HKEY);
+    HMODULE adv = LoadLibraryW(L"advapi32.dll");
+    PFN_ROKE open  = adv ? (PFN_ROKE)GetProcAddress(adv, "RegOpenKeyExW") : NULL;
+    PFN_RQVE query = adv ? (PFN_RQVE)GetProcAddress(adv, "RegQueryValueExW") : NULL;
+    PFN_RCK  close = adv ? (PFN_RCK)GetProcAddress(adv, "RegCloseKey") : NULL;
+    HKEY key;
+    if (!open || !query || !close ||
+        open(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return false;
+    DWORD light = 1, size = sizeof light;
+    bool dark = query(key, L"AppsUseLightTheme", NULL, NULL, (LPBYTE)&light, &size) == ERROR_SUCCESS && light == 0;
+    close(key);
+    return dark;
+}
+
+// A window's control theme for the current mode: `dark` names the system's dark one. Untouched
+// until dark mode has been seen.
+static void ThemeControl(HWND h, const wchar_t* dark)
+{
+    if (!g_darkEver) return;
+    typedef HRESULT (WINAPI* PFN_SWT)(HWND, LPCWSTR, LPCWSTR);
+    static PFN_SWT setTheme;
+    static bool tried;
+    if (!tried) {
+        tried = true;
+        if (HMODULE ux = LoadLibraryW(L"uxtheme.dll")) setTheme = (PFN_SWT)GetProcAddress(ux, "SetWindowTheme");
+    }
+    if (setTheme) setTheme(h, g_dark ? dark : NULL, NULL);
+}
+
+// Reads the app mode and applies it to the title bar, the scroll bar and the address boxes; the
+// rest picks it up as it paints.
+static void ApplyTheme()
+{
+    typedef HRESULT (WINAPI* PFN_DWMSWA)(HWND, DWORD, LPCVOID, DWORD);
+    static PFN_DWMSWA dwmSet;
+    static bool tried;
+    if (!tried) {
+        tried = true;
+        if (HMODULE dwm = LoadLibraryW(L"dwmapi.dll")) dwmSet = (PFN_DWMSWA)GetProcAddress(dwm, "DwmSetWindowAttribute");
+    }
+    // DWMWA_USE_IMMERSIVE_DARK_MODE is 20, and was 19 before Windows 10 2004.
+    BOOL want = AppsUseDarkTheme();
+    bool set = dwmSet && (SUCCEEDED(dwmSet(g_hwnd, 20, &want, sizeof want)) || SUCCEEDED(dwmSet(g_hwnd, 19, &want, sizeof want)));
+    g_dark = set && want;
+    if (g_dark && !g_darkEver) {
+        g_darkEver = true;
+        g_darkFace = CreateSolidBrush(Colour(kDarkFace));
+        g_darkField = CreateSolidBrush(Colour(kDark.graphBack));
+    }
+    ThemeControl(g_hwnd, L"DarkMode_Explorer");
+    for (Row* r : g_rows) ThemeControl(r->edit, L"DarkMode_CFD");
+}
+
+// UTF-8 to UTF-16 and back, for the core's texts and the files.
+static std::wstring Widen(const std::string& s)
+{
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), NULL, 0);
+    std::wstring w(n, 0);
+    if (n) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
+static std::string Narrow(const std::wstring& w)
+{
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), NULL, 0, NULL, NULL);
+    std::string s(n, 0);
+    if (n) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, NULL, NULL);
+    return s;
+}
 
 // ---------------------------------------------------------------------------------------------
 // Ping worker thread
@@ -386,6 +432,25 @@ static std::wstring ConfigDir(bool create)
 
 static std::wstring ConfigPath(bool create) { return ConfigDir(create) + L"\\addresses.txt"; }
 
+static bool ReadWholeFile(const std::wstring& path, std::string* bytes)
+{
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    char buf[4096]; DWORD got;
+    while (ReadFile(f, buf, sizeof buf, &got, NULL) && got) bytes->append(buf, got);
+    CloseHandle(f);
+    return true;
+}
+
+static void WriteWholeFile(const std::wstring& path, const std::string& bytes)
+{
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD wrote;
+    if (!bytes.empty()) WriteFile(f, bytes.data(), (DWORD)bytes.size(), &wrote, NULL);
+    CloseHandle(f);
+}
+
 // Window placement: "left top width height" in screen pixels, in window.txt next to the addresses.
 
 static void SaveWindowRect(HWND h)
@@ -404,131 +469,49 @@ static void SaveWindowRect(HWND h)
     } else {
         GetWindowRect(h, &r);
     }
-    char buf[96];
-    int n = FormatA(buf, sizeof buf, "%ld %ld %ld %ld\r\n", r.left, r.top, r.right - r.left, r.bottom - r.top);
-    std::wstring path = ConfigDir(true) + L"\\window.txt";
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (f == INVALID_HANDLE_VALUE) return;
-    DWORD wrote;
-    WriteFile(f, buf, (DWORD)n, &wrote, NULL);
-    CloseHandle(f);
+    WindowRect wr = { r.left, r.top, r.right - r.left, r.bottom - r.top };
+    WriteWholeFile(ConfigDir(true) + L"\\window.txt", FormatWindowRect(wr, "\r\n"));
 }
 
-// Loads the saved rectangle and makes it fit the work area of the monitor it is nearest to, so a
-// changed screen layout or resolution never leaves the window off screen or larger than the screen.
+// Loads the saved rectangle and makes it fit the work area of the monitor it is nearest to.
 static bool LoadWindowRect(RECT* out)
 {
-    std::wstring path = ConfigDir(false) + L"\\window.txt";
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (f == INVALID_HANDLE_VALUE) return false;
-    char buf[128] = { 0 };
-    DWORD got = 0;
-    ReadFile(f, buf, sizeof buf - 1, &got, NULL);
-    CloseHandle(f);
-    long x, y, w, hgt;
-    if (sscanf(buf, "%ld %ld %ld %ld", &x, &y, &w, &hgt) != 4) return false;
-    if (w < 100 || hgt < 100 || w > 20000 || hgt > 20000) return false;
-
-    RECT r = { x, y, x + w, y + hgt };
+    std::string text;
+    WindowRect wr = { 0, 0, 0, 0 };
+    if (!ReadWholeFile(ConfigDir(false) + L"\\window.txt", &text) || !ParseWindowRect(text, &wr)) return false;
+    RECT r = { wr.x, wr.y, wr.x + wr.w, wr.y + wr.h };
     MONITORINFO mi = { sizeof mi };
     if (!GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mi)) return false;
     const RECT& wa = mi.rcWork;
-    long maxW = wa.right - wa.left, maxH = wa.bottom - wa.top;
-    if (w > maxW) w = maxW;
-    if (hgt > maxH) hgt = maxH;
-    if (x + w > wa.right) x = wa.right - w;
-    if (y + hgt > wa.bottom) y = wa.bottom - hgt;
-    if (x < wa.left) x = wa.left;
-    if (y < wa.top) y = wa.top;
-    out->left = x; out->top = y; out->right = x + w; out->bottom = y + hgt;
+    FitWindowRect(&wr, wa.left, wa.top, wa.right - wa.left, wa.bottom - wa.top);
+    out->left = wr.x; out->top = wr.y; out->right = wr.x + wr.w; out->bottom = wr.y + wr.h;
     return true;
-}
-
-static std::wstring Trim(const std::wstring& s)
-{
-    size_t a = 0, b = s.size();
-    while (a < b && iswspace(s[a])) a++;
-    while (b > a && iswspace(s[b - 1])) b--;
-    return s.substr(a, b - a);
 }
 
 static bool LoadAddresses(std::vector<std::wstring>& out)
 {
-    std::wstring path = ConfigPath(false);
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (f == INVALID_HANDLE_VALUE) return false;
     std::string bytes;
-    char buf[4096]; DWORD got;
-    while (ReadFile(f, buf, sizeof buf, &got, NULL) && got) bytes.append(buf, got);
-    CloseHandle(f);
-
-    size_t start = 0;
-    while (start <= bytes.size()) {
-        size_t nl = bytes.find('\n', start);
-        if (nl == std::string::npos) nl = bytes.size();
-        std::string line = bytes.substr(start, nl - start);
-        start = nl + 1;
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty()) continue;
-        int wn = MultiByteToWideChar(CP_UTF8, 0, line.c_str(), (int)line.size(), NULL, 0);
-        std::wstring w(wn, 0);
-        MultiByteToWideChar(CP_UTF8, 0, line.c_str(), (int)line.size(), &w[0], wn);
-        w = Trim(w);
-        if (!w.empty()) out.push_back(w);
-    }
+    if (!ReadWholeFile(ConfigPath(false), &bytes)) return false;
+    for (const std::string& a : ParseAddresses(bytes)) out.push_back(Widen(a));
     return true;
 }
 
 static void SaveAddresses()
 {
-    std::string bytes;
-    for (Row* r : g_rows) {
-        if (r->addr.empty()) continue;
-        int n = WideCharToMultiByte(CP_UTF8, 0, r->addr.c_str(), (int)r->addr.size(), NULL, 0, NULL, NULL);
-        std::string a(n, 0);
-        WideCharToMultiByte(CP_UTF8, 0, r->addr.c_str(), (int)r->addr.size(), &a[0], n, NULL, NULL);
-        bytes += a; bytes += "\r\n";
-    }
-    std::wstring path = ConfigPath(true);
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (f == INVALID_HANDLE_VALUE) return;
-    DWORD wrote;
-    if (!bytes.empty()) WriteFile(f, bytes.data(), (DWORD)bytes.size(), &wrote, NULL);
-    CloseHandle(f);
+    std::vector<std::string> addrs;
+    for (Row* r : g_rows) addrs.push_back(Narrow(r->addr));
+    WriteWholeFile(ConfigPath(true), JoinAddresses(addrs, "\r\n"));
 }
 
 // ---------------------------------------------------------------------------------------------
 // Layout
 // ---------------------------------------------------------------------------------------------
 
-struct Cols { int x[NCOL], w[NCOL]; };
-
-static Cols ComputeCols(int clientW)
-{
-    Cols c;
-    int fixed = 0;
-    for (int i = 0; i < NCOL; i++) {
-        c.w[i] = S(g_colBase[i]);
-        if (i != C_GRAPH) fixed += c.w[i];
-    }
-    int avail = clientW - 2 * S(MARGIN) - (NCOL - 1) * S(GAP) - S(GRAPH_GAP) - S(DEL_GAP) - fixed;
-    if (avail > c.w[C_GRAPH]) c.w[C_GRAPH] = avail;
-    c.x[0] = S(MARGIN);
-    for (int i = 1; i < NCOL; i++) c.x[i] = c.x[i - 1] + c.w[i - 1] + S(GAP) + (i == C_GRAPH ? S(GRAPH_GAP) : i == C_DEL ? S(DEL_GAP) : 0);
-    return c;
-}
-
-static int MinContentWidth()
-{
-    int w = 2 * S(MARGIN) + (NCOL - 1) * S(GAP) + S(GRAPH_GAP) + S(DEL_GAP);
-    for (int i = 0; i < NCOL; i++) w += S(g_colBase[i]);
-    return w;
-}
-
-static int LogoTop()    { return S(MARGIN) / 2; }
-static int HeaderTop()  { return LogoTop() + S(LOGO_H) + S(2); }
-static int RowsTop()    { return HeaderTop() + S(HDR_H) + S(MARGIN) / 2; }
-static int ContentHeightFor(int rows) { return RowsTop() + rows * S(ROW_H) + S(MARGIN); }
+static Cols ComputeCols(int clientW) { return Mx().Columns(clientW); }
+static int MinContentWidth()            { return Mx().MinContentWidth(); }
+static int LogoTop()                    { return Mx().LogoTop(); }
+static int HeaderTop()                  { return Mx().HeaderTop(); }
+static int ContentHeightFor(int rows)   { return Mx().ContentHeightFor(rows); }
 
 // Scrolling is by whole rows: the title and header stay put, rows g_firstRow .. g_firstRow+fit-1
 // are shown, and any row that would not fit completely is hidden rather than drawn partially.
@@ -536,8 +519,7 @@ static int ContentHeightFor(int rows) { return RowsTop() + rows * S(ROW_H) + S(M
 static int RowsThatFit()
 {
     RECT rc; GetClientRect(g_hwnd, &rc);
-    int fit = (rc.bottom - RowsTop()) / S(ROW_H);
-    return fit < 1 ? 1 : fit;
+    return Mx().RowsThatFit(rc.bottom);
 }
 
 #ifdef MP_DEBUG_LOG
@@ -562,7 +544,6 @@ static void Layout()
 {
     RECT rc; GetClientRect(g_hwnd, &rc);
     Cols c = ComputeCols(rc.right);
-    int ch = S(CTRL_H);
     int fit = RowsThatFit();
     HDWP dwp = BeginDeferWindowPos((int)g_rows.size() * 8);
     LOG("Layout: rows=%d client=%dx%d fit=%d first=%d dpi=%u dwp=%p x0=%d w0=%d xg=%d wg=%d",
@@ -570,18 +551,15 @@ static void Layout()
     for (size_t i = 0; i < g_rows.size(); i++) {
         Row* r = g_rows[i];
         bool shown = (int)i >= g_firstRow && (int)i < g_firstRow + fit;
-        int y = RowsTop() + ((int)i - g_firstRow) * S(ROW_H);
-        int yc = y + (S(ROW_H) - ch) / 2;
+        int y = Mx().RowTop((int)i - g_firstRow);
         HWND ctl[NCOL] = { r->edit, r->cur, r->mn, r->med, r->avg, r->mx, r->graph, r->del };
         for (int k = 0; k < NCOL; k++) {
-            int cy = yc, chh = ch;
-            if (k == C_GRAPH) { cy = y + S(3); chh = S(ROW_H) - S(6); }
-            if (k == C_DEL)   { cy = y + (S(ROW_H) - c.w[C_DEL]) / 2; chh = c.w[C_DEL]; }
+            Rect cell = Mx().Cell(c, k, y);
             // Show/hide is done separately: DeferWindowPos may not move or size a window in the
             // same call that shows or hides it (Windows XP enforces this; later versions do not).
             if (shown != (IsWindowVisible(ctl[k]) != FALSE))
                 ShowWindow(ctl[k], shown ? SW_SHOWNA : SW_HIDE);
-            dwp = DeferWindowPos(dwp, ctl[k], NULL, c.x[k], cy, c.w[k], chh, SWP_NOZORDER | SWP_NOACTIVATE);
+            dwp = DeferWindowPos(dwp, ctl[k], NULL, cell.x, cell.y, cell.w, cell.h, SWP_NOZORDER | SWP_NOACTIVATE);
             if (!dwp) LOG("  DeferWindowPos failed row=%d col=%d hwnd=%p err=%lu", (int)i, k, (void*)ctl[k], GetLastError());
         }
     }
@@ -592,9 +570,7 @@ static void Layout()
 static void UpdateScroll()
 {
     int fit = RowsThatFit(), n = (int)g_rows.size();
-    int maxFirst = n > fit ? n - fit : 0;
-    if (g_firstRow > maxFirst) g_firstRow = maxFirst;
-    if (g_firstRow < 0) g_firstRow = 0;
+    g_firstRow = ClampFirstRow(g_firstRow, n, fit);
     SCROLLINFO si = { sizeof si };
     si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
     si.nMin = 0;
@@ -606,10 +582,7 @@ static void UpdateScroll()
 
 static void SetFirstRow(int first)
 {
-    int fit = RowsThatFit(), n = (int)g_rows.size();
-    int maxFirst = n > fit ? n - fit : 0;
-    if (first > maxFirst) first = maxFirst;
-    if (first < 0) first = 0;
+    first = ClampFirstRow(first, (int)g_rows.size(), RowsThatFit());
     if (first == g_firstRow) return;
     g_firstRow = first;
     UpdateScroll();
@@ -638,65 +611,19 @@ static size_t IndexOfEdit(HWND edit)
     return (size_t)-1;
 }
 
-static void ResetStats(Row* r)
-{
-    r->samples.clear();
-    r->ringCount = r->ringHead = 0;
-    r->last = RES_NONE;
-}
-
-static void PushRing(Row* r, int v)
-{
-    r->ring[r->ringHead] = v;
-    r->ringHead = (r->ringHead + 1) % RING_N;
-    if (r->ringCount < RING_N) r->ringCount++;
-}
-
-// Formats a millisecond value with precision that suits its magnitude: 0.37, 4.21, 23.5, 187.
-static void FormatMs(double ms, wchar_t* out, size_t n)
-{
-    if (ms < 10.0)       FormatW(out, n, L"%.2f", ms);
-    else if (ms < 100.0) FormatW(out, n, L"%.1f", ms);
-    else                 FormatW(out, n, L"%.0f", ms);
-}
-
 static void UpdateLabels(Row* r)
 {
-    wchar_t b[64], vs[32];
-    if (r->last == RES_NONE)         CopyW(b, 64, L"-");
-    else if (r->last == RES_NOHOST)  CopyW(b, 64, L"no host");
-    else if (r->last == RES_TIMEOUT) CopyW(b, 64, L"timeout");
-    else { FormatMs((double)r->last / 1000.0, vs, 32); FormatW(b, 64, L"%ls ms", vs); }
-    SetWindowTextW(r->cur, b);
-
-    if (r->samples.empty()) {
-        SetWindowTextW(r->mn, L"-"); SetWindowTextW(r->med, L"-");
-        SetWindowTextW(r->avg, L"-"); SetWindowTextW(r->mx, L"-");
-        return;
-    }
-    double mn = r->samples[0], mx = r->samples[0], sum = 0;
-    for (double v : r->samples) { if (v < mn) mn = v; if (v > mx) mx = v; sum += v; }
-    double avg = sum / (double)r->samples.size();
-    std::vector<double> tmp(r->samples);
-    size_t n = tmp.size();
-    std::nth_element(tmp.begin(), tmp.begin() + n / 2, tmp.end());
-    double med = tmp[n / 2];
-    if ((n % 2) == 0) {
-        double lo = *std::max_element(tmp.begin(), tmp.begin() + n / 2);
-        med = (lo + med) / 2.0;
-    }
-    FormatMs(mn, b, 64);  SetWindowTextW(r->mn, b);
-    FormatMs(med, b, 64); SetWindowTextW(r->med, b);
-    FormatMs(avg, b, 64); SetWindowTextW(r->avg, b);
-    FormatMs(mx, b, 64);  SetWindowTextW(r->mx, b);
+    std::string summary[4];
+    r->stats.Summary(summary);
+    SetWindowTextW(r->cur, Widen(r->stats.Current()).c_str());
+    HWND ctl[4] = { r->mn, r->med, r->avg, r->mx };
+    for (int i = 0; i < 4; i++) SetWindowTextW(ctl[i], Widen(summary[i]).c_str());
 }
 
-// res: microseconds (>= 0) or a RES_* code. Samples are kept in ms, the ring in microseconds.
-static void RecordResult(Row* r, LPARAM res)
+// res: microseconds (>= 0) or a RES_* code.
+static void RecordResult(Row* r, int res)
 {
-    r->last = res;
-    if (res >= 0) { r->samples.push_back((double)res / 1000.0); PushRing(r, (int)res); }
-    else if (res == RES_TIMEOUT) PushRing(r, -1);
+    r->stats.Record(res);
     UpdateLabels(r);
     InvalidateRect(r->graph, NULL, FALSE);
 }
@@ -717,16 +644,16 @@ static Row* AddRow(const std::wstring& addr)
     r->id = g_nextRowId++;
     r->addr = addr;
     r->ctx = NULL;
-    ResetStats(r);
     HINSTANCE hi = GetModuleHandle(NULL);
 
     r->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", addr.c_str(),
                               WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_LEFT,
                               0, 0, 10, 10, g_hwnd, NULL, hi, NULL);
     SendMessage(r->edit, WM_SETFONT, (WPARAM)g_font, FALSE);
-    SendMessage(r->edit, EM_SETCUEBANNER, FALSE, (LPARAM)L"host or IP address");
+    SendMessage(r->edit, EM_SETCUEBANNER, FALSE, (LPARAM)Widen(kCue).c_str());
     WNDPROC old = (WNDPROC)SetWindowLongPtrW(r->edit, GWLP_WNDPROC, (LONG_PTR)EditProc);
     if (!g_oldEditProc) g_oldEditProc = old;
+    ThemeControl(r->edit, L"DarkMode_CFD");
 
     r->cur = MakeStatic(SS_RIGHT);
     r->mn  = MakeStatic(SS_RIGHT);
@@ -768,11 +695,11 @@ static bool ApplyEdit(Row* r)
 {
     wchar_t buf[512];
     GetWindowTextW(r->edit, buf, 512);
-    std::wstring a = Trim(buf);
+    std::wstring a = Widen(Trim(Narrow(buf)));
     if (a == r->addr) return false;
     r->addr = a;
     StopPing(r);
-    ResetStats(r);
+    r->stats.Reset();
     UpdateLabels(r);
     InvalidateRect(r->graph, NULL, FALSE);
     StartPing(r);
@@ -820,15 +747,6 @@ static LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM w, LPARAM l)
 // Graph control
 // ---------------------------------------------------------------------------------------------
 
-// Rounds a microsecond value up to a readable axis maximum (0.1 ms, 0.2, 0.5, 1, 2, 5, 10 ... 10 s).
-static int NiceCeil(int v)
-{
-    static const int steps[] = { 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000,
-                                 200000, 500000, 1000000, 2000000, 5000000, 10000000 };
-    for (int s : steps) if (v <= s) return s;
-    return ((v + 9999999) / 10000000) * 10000000;
-}
-
 static void PaintGraph(HWND h, Row* r)
 {
     PAINTSTRUCT ps;
@@ -841,68 +759,48 @@ static void PaintGraph(HWND h, Row* r)
     HBITMAP bmp = CreateCompatibleBitmap(hdc, W, H);
     HGDIOBJ oldBmp = SelectObject(mdc, bmp);
 
-    HBRUSH white = (HBRUSH)GetStockObject(WHITE_BRUSH);
-    FillRect(mdc, &rc, white);
+    const Palette& P = Pal();
+    HBRUSH back = CreateSolidBrush(Colour(P.graphBack));
+    FillRect(mdc, &rc, back);
+    DeleteObject(back);
 
-    RECT plot = { 1, 1, W - 1, H - 1 };
-    int pw = plot.right - plot.left, ph = plot.bottom - plot.top;
-
-    int maxv = 0;
-    for (int i = 0; i < r->ringCount; i++) {
-        int idx = (r->ringHead + RING_N - r->ringCount + i) % RING_N;
-        if (r->ring[idx] > maxv) maxv = r->ring[idx];
-    }
-    int nice = NiceCeil(maxv < 1 ? 1000 : maxv);   // 1 ms scale until there is data
+    Graph g = LayoutGraph(r->stats, W, H);
+    int bottom = g.plot.y + g.plot.h;
 
     // Grid lines at 25 / 50 / 75 %.
-    HPEN grid = CreatePen(PS_SOLID, 1, RGB(228, 228, 228));
+    HPEN grid = CreatePen(PS_SOLID, 1, Colour(P.graphGrid));
     HGDIOBJ oldPen = SelectObject(mdc, grid);
-    for (int q = 1; q < 4; q++) {
-        int y = plot.bottom - ph * q / 4;
-        MoveToEx(mdc, plot.left, y, NULL); LineTo(mdc, plot.right, y);
+    for (int y : g.gridY) {
+        MoveToEx(mdc, g.plot.x, y, NULL); LineTo(mdc, g.plot.x + g.plot.w, y);
     }
     SelectObject(mdc, oldPen);
     DeleteObject(grid);
 
-    HBRUSH blue = CreateSolidBrush(RGB(58, 128, 214));
-    HBRUSH pink = CreateSolidBrush(RGB(255, 214, 214));
-    HBRUSH red  = CreateSolidBrush(RGB(222, 54, 54));
-    for (int i = 0; i < r->ringCount; i++) {
-        int idx = (r->ringHead + RING_N - r->ringCount + i) % RING_N;
-        int slot = RING_N - r->ringCount + i;             // newest sample at the right edge
-        int x0 = plot.left + slot * pw / RING_N;
-        int x1 = plot.left + (slot + 1) * pw / RING_N;
-        if (x1 <= x0) x1 = x0 + 1;
-        int v = r->ring[idx];
-        RECT bar;
-        if (v >= 0) {
-            int y = plot.bottom - (int)((long long)v * ph / nice);
-            if (y >= plot.bottom) y = plot.bottom - 1;
-            if (y < plot.top) y = plot.top;
-            bar.left = x0; bar.right = x1; bar.top = y; bar.bottom = plot.bottom;
+    HBRUSH blue = CreateSolidBrush(Colour(P.graphBar));
+    HBRUSH pink = CreateSolidBrush(Colour(P.graphTimeout));
+    HBRUSH red  = CreateSolidBrush(Colour(P.graphTimeoutTop));
+    for (const GraphBar& b : g.bars) {
+        RECT bar = { b.x0, b.top, b.x1, bottom };
+        if (!b.timeout) {
             FillRect(mdc, &bar, blue);
         } else {
-            bar.left = x0; bar.right = x1; bar.top = plot.top; bar.bottom = plot.bottom;
             FillRect(mdc, &bar, pink);
-            bar.bottom = plot.top + S(3);
+            bar.bottom = b.top + S(3);
             FillRect(mdc, &bar, red);
         }
     }
     DeleteObject(blue); DeleteObject(pink); DeleteObject(red);
 
     // Scale label, top-left.
-    wchar_t lbl[32], lv[32];
-    FormatMs((double)nice / 1000.0, lv, 32);
-    FormatW(lbl, 32, L"%ls ms", lv);
     HGDIOBJ oldFont = SelectObject(mdc, g_fontSmall);
-    SetBkMode(mdc, OPAQUE);                 // white backing keeps the label legible over tall bars
-    SetBkColor(mdc, RGB(255, 255, 255));
-    SetTextColor(mdc, RGB(110, 110, 110));
-    RECT lr = { plot.left + S(3), plot.top + S(1), plot.right, plot.bottom };
-    DrawTextW(mdc, lbl, -1, &lr, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+    SetBkMode(mdc, OPAQUE);                 // the graph's colour behind it keeps the label legible over tall bars
+    SetBkColor(mdc, Colour(P.graphBack));
+    SetTextColor(mdc, Colour(P.graphLabel));
+    RECT lr = { g.plot.x + S(3), g.plot.y + S(1), g.plot.x + g.plot.w, bottom };
+    DrawTextW(mdc, Widen(g.scaleLabel).c_str(), -1, &lr, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
     SelectObject(mdc, oldFont);
 
-    HBRUSH border = CreateSolidBrush(RGB(160, 160, 160));
+    HBRUSH border = CreateSolidBrush(Colour(P.graphBorder));
     FrameRect(mdc, &rc, border);
     DeleteObject(border);
 
@@ -948,9 +846,10 @@ static void PaintDelete(HWND h, DelState* st)
     HDC mdc = CreateCompatibleDC(hdc);
     HBITMAP bmp = CreateCompatibleBitmap(hdc, W, H);
     HGDIOBJ oldBmp = SelectObject(mdc, bmp);
-    FillRect(mdc, &rc, GetSysColorBrush(COLOR_BTNFACE));
+    FillRect(mdc, &rc, FaceBrush());
 
-    COLORREF col = st->down ? RGB(170, 30, 30) : (st->hover ? RGB(240, 70, 70) : RGB(214, 44, 44));
+    const Palette& P = Pal();
+    COLORREF col = Colour(st->down ? P.delDown : st->hover ? P.delHover : P.del);
     if (!DrawDeleteD2D(mdc, rc, col)) {
         // GDI fallback (not antialiased).
         int d = (W < H ? W : H);
@@ -1075,10 +974,10 @@ static bool DrawColorEmoji(HDC hdc, const RECT& rc)
     if (!InitD2D() || !g_emojiFmt) return false;
     if (FAILED(g_rt->BindDC(hdc, &rc))) return false;
     g_rt->BeginDraw();
-    COLORREF bg = GetSysColor(COLOR_BTNFACE);
+    COLORREF bg = Face(), ink = Ink();
     g_rt->Clear(D2D1::ColorF(GetRValue(bg) / 255.0f, GetGValue(bg) / 255.0f, GetBValue(bg) / 255.0f));
     ID2D1SolidColorBrush* brush = NULL;
-    g_rt->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Black), &brush);
+    g_rt->CreateSolidColorBrush(D2D1::ColorF(GetRValue(ink) / 255.0f, GetGValue(ink) / 255.0f, GetBValue(ink) / 255.0f), &brush);
     D2D1_RECT_F lr = D2D1::RectF(0, 0, (float)(rc.right - rc.left), (float)(rc.bottom - rc.top));
     if (brush) {
         // D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT (= 4); spelled numerically because the Windows
@@ -1100,22 +999,19 @@ static bool DrawDeleteD2D(HDC hdc, const RECT& rc, COLORREF circle)
 {
     if (!InitD2D()) return false;
     if (FAILED(g_rt->BindDC(hdc, &rc))) return false;
-    float W = (float)(rc.right - rc.left), H = (float)(rc.bottom - rc.top);
-    float d = W < H ? W : H;
-    float cx = W / 2.0f, cy = H / 2.0f, rad = d / 2.0f - 0.5f;
-    float thick = d / 9.0f; if (thick < 2.0f) thick = 2.0f;
-    float ins = rad * 0.45f;
+    DeleteGlyph d = LayoutDelete((float)(rc.right - rc.left), (float)(rc.bottom - rc.top));
+    float cx = d.cx, cy = d.cy, ins = d.inset;
 
     g_rt->BeginDraw();
-    COLORREF bg = GetSysColor(COLOR_BTNFACE);
+    COLORREF bg = Face();
     g_rt->Clear(D2D1::ColorF(GetRValue(bg) / 255.0f, GetGValue(bg) / 255.0f, GetBValue(bg) / 255.0f));
     ID2D1SolidColorBrush* red = NULL; ID2D1SolidColorBrush* white = NULL;
     g_rt->CreateSolidColorBrush(D2D1::ColorF(GetRValue(circle) / 255.0f, GetGValue(circle) / 255.0f, GetBValue(circle) / 255.0f), &red);
     g_rt->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), &white);
     if (red && white) {
-        g_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), rad, rad), red);
-        g_rt->DrawLine(D2D1::Point2F(cx - ins, cy - ins), D2D1::Point2F(cx + ins, cy + ins), white, thick);
-        g_rt->DrawLine(D2D1::Point2F(cx - ins, cy + ins), D2D1::Point2F(cx + ins, cy - ins), white, thick);
+        g_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), d.radius, d.radius), red);
+        g_rt->DrawLine(D2D1::Point2F(cx - ins, cy - ins), D2D1::Point2F(cx + ins, cy + ins), white, d.stroke);
+        g_rt->DrawLine(D2D1::Point2F(cx - ins, cy + ins), D2D1::Point2F(cx + ins, cy - ins), white, d.stroke);
     }
     if (red) red->Release();
     if (white) white->Release();
@@ -1124,19 +1020,11 @@ static bool DrawDeleteD2D(HDC hdc, const RECT& rc, COLORREF circle)
     return SUCCEEDED(hr) && red && white;
 }
 
-// "Build 2026-10-17 from git abc1234", with the compiler's "Mmm dd yyyy" date turned into ISO form.
 static const wchar_t* BuildInfoText()
 {
-    static wchar_t text[96];
-    if (text[0]) return text;
-    const char* d = __DATE__;
-    static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
-    int mon = 0;
-    for (int i = 0; i < 12; i++) if (strncmp(months + 3 * i, d, 3) == 0) { mon = i + 1; break; }
-    int day = (d[4] == ' ' ? 0 : (d[4] - '0') * 10) + (d[5] - '0');
-    int year = atoi(d + 7);
-    FormatW(text, 96, L"Build %04d-%02d-%02d from git " WIDE(GIT_REV), year, mon, day);
-    return text;
+    static std::wstring text;
+    if (text.empty()) text = Widen(BuildInfo(__DATE__, GIT_REV));
+    return text.c_str();
 }
 
 static void CreateFonts()
@@ -1183,13 +1071,14 @@ static void PaintMain(HWND h)
     RECT rc; GetClientRect(h, &rc);
     Cols c = ComputeCols(rc.right);
     SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, GetSysColor(COLOR_BTNTEXT));
+    SetTextColor(hdc, Ink());
 
     // Title, large and bold, aligned with the Address column.
     HGDIOBJ oldFont = SelectObject(hdc, g_fontLogo);
     RECT lr = { c.x[0], LogoTop(), rc.right, LogoTop() + S(LOGO_H) };
-    DrawTextW(hdc, L"MultiPing", -1, &lr, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
-    SIZE ts; GetTextExtentPoint32W(hdc, L"MultiPing", 9, &ts);
+    std::wstring title = Widen(kTitle);
+    DrawTextW(hdc, title.c_str(), -1, &lr, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
+    SIZE ts; GetTextExtentPoint32W(hdc, title.c_str(), (int)title.size(), &ts);
     lr.left += ts.cx + S(10);
     RECT er = { lr.left, lr.top, lr.left + S(LOGO_H) * 3 / 2, lr.bottom };
     if (!g_haveEmojiFont) {
@@ -1208,23 +1097,23 @@ static void PaintMain(HWND h)
 
     // Copyright and revision, stacked, right-aligned to the window margin beside the title.
     SelectObject(hdc, g_fontInfo);
-    SetTextColor(hdc, RGB(80, 80, 80));
+    SetTextColor(hdc, Colour(Pal().infoText));
     TEXTMETRICW tm; GetTextMetricsW(hdc, &tm);
     int iy = LogoTop() + (S(LOGO_H) - 2 * tm.tmHeight) / 2;
     RECT ir = { er.right, iy, rc.right - S(MARGIN), iy + tm.tmHeight };
-    DrawTextW(hdc, COPYRIGHT_TEXT, -1, &ir, DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+    DrawTextW(hdc, Widen(kCopyright).c_str(), -1, &ir, DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
     ir.top += tm.tmHeight; ir.bottom += tm.tmHeight;
     DrawTextW(hdc, BuildInfoText(), -1, &ir, DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
-    SetTextColor(hdc, GetSysColor(COLOR_BTNTEXT));
+    SetTextColor(hdc, Ink());
 
     SelectObject(hdc, g_font);
     int y = HeaderTop();
     for (int k = 0; k < NCOL; k++) {
         RECT r = { c.x[k], y, c.x[k] + c.w[k], y + S(HDR_H) };
-        UINT align = (k == C_ADDR || k == C_GRAPH) ? DT_LEFT : DT_RIGHT;
-        DrawTextW(hdc, g_colNames[k], -1, &r, align | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        UINT align = LeftAligned(k) ? DT_LEFT : DT_RIGHT;
+        DrawTextW(hdc, Widen(kColNames[k]).c_str(), -1, &r, align | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     }
-    HPEN pen = CreatePen(PS_SOLID, 1, RGB(170, 170, 170));
+    HPEN pen = CreatePen(PS_SOLID, 1, Colour(Pal().headerLine));
     HGDIOBJ oldPen = SelectObject(hdc, pen);
     int ly = y + S(HDR_H);
     MoveToEx(hdc, c.x[0], ly, NULL);
@@ -1261,6 +1150,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_CREATE: {
         g_hwnd = h;
         if (g_pGetDpiForWindow) g_dpi = g_pGetDpiForWindow(h);
+        ApplyTheme();
         CreateFonts();
         std::vector<std::wstring> addrs;
         LoadAddresses(addrs);
@@ -1275,7 +1165,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_GETMINMAXINFO: {
         MINMAXINFO* mmi = (MINMAXINFO*)l;
-        RECT r = { 0, 0, MinContentWidth() + GetSystemMetrics(SM_CXVSCROLL), ContentHeightFor(2) };
+        RECT r = { 0, 0, MinContentWidth() + GetSystemMetrics(SM_CXVSCROLL), ContentHeightFor(MIN_ROWS) };
         AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, FALSE, 0);
         mmi->ptMinTrackSize.x = r.right - r.left;
         mmi->ptMinTrackSize.y = r.bottom - r.top;
@@ -1284,10 +1174,27 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_PAINT:
         PaintMain(h);
         return 0;
+    case WM_ERASEBKGND: {
+        RECT rc; GetClientRect(h, &rc);
+        FillRect((HDC)w, &rc, FaceBrush());
+        return 1;
+    }
     case WM_CTLCOLORSTATIC:
         SetBkMode((HDC)w, TRANSPARENT);
-        SetTextColor((HDC)w, GetSysColor(COLOR_BTNTEXT));
-        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+        SetTextColor((HDC)w, Ink());
+        return (LRESULT)FaceBrush();
+    case WM_CTLCOLOREDIT:
+        if (!g_dark) break;
+        SetTextColor((HDC)w, Ink());
+        SetBkColor((HDC)w, Colour(kDark.graphBack));
+        return (LRESULT)g_darkField;
+    case WM_SETTINGCHANGE:
+        // The app mode changed in Settings.
+        if (l && lstrcmpiW((const wchar_t*)l, L"ImmersiveColorSet") == 0) {
+            ApplyTheme();
+            RedrawWindow(h, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+        }
+        break;
     case WM_VSCROLL:
         OnVScroll(w);
         return 0;
@@ -1313,7 +1220,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
                 // whatever the ICMP stack's timing. Windows XP, for one, lets IcmpSendEcho run
                 // past its nominal timeout.
                 bool fresh = InterlockedCompareExchange(&c->ready, 0, 1) == 1 && c->resultSeq == c->seq;
-                RecordResult(r, fresh ? (LPARAM)c->result : (LPARAM)RES_TIMEOUT);
+                RecordResult(r, fresh ? (int)c->result : (int)RES_TIMEOUT);
             }
             c->seq++;
             c->inflight = true;
@@ -1440,7 +1347,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int nShow)
     if (!wc.hIconSm) wc.hIconSm = wc.hIcon;
     RegisterClassExW(&wc);
 
-    RECT r = { 0, 0, MinContentWidth() + S(95), ContentHeightFor(8) };   // 8 rows, graph about 335 px wide
+    RECT r = { 0, 0, Mx().DefaultWidth(), ContentHeightFor(DEFAULT_ROWS) };
     AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, FALSE, 0);
     int x = CW_USEDEFAULT, y = CW_USEDEFAULT, w = r.right - r.left, hgt = r.bottom - r.top;
     RECT saved;
