@@ -94,3 +94,78 @@ jobs:
             || gh release create "${GITHUB_REF_NAME}" --title "MultiPing ${GITHUB_REF_NAME}" --generate-notes \
             || true
           gh release upload "${GITHUB_REF_NAME}" MultiPingXP.exe --clobber
+
+  build-linux:
+    name: multiping-gtk, -qt5, -qt6 (x86_64, Debian 12+ / Ubuntu 24.04+)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # In Docker's Debian bookworm (build_linux.Dockerfile), so the programs need nothing newer
+      # than glibc 2.36, GTK 3.24, Qt 5.15 and Qt 6.4.
+      - name: Build
+        run: ./build_linux.sh
+
+      - name: Check requirements
+        run: |
+          for f in multiping-gtk multiping-qt5 multiping-qt6; do
+            echo "$f: $(objdump -T $f | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)," \
+                 "needs $(objdump -p $f | awk '/NEEDED/ { print $2 }' | tr '\n' ' ')"
+          done
+
+      # A tarball keeps the programs executable, which an artifact or a release download does not.
+      - name: Package
+        run: tar -czvf multiping-linux-x86_64.tar.gz multiping-gtk multiping-qt5 multiping-qt6
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: multiping-linux-x86_64
+          path: multiping-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 \
+            || gh release create "${GITHUB_REF_NAME}" --title "MultiPing ${GITHUB_REF_NAME}" --generate-notes \
+            || true
+          gh release upload "${GITHUB_REF_NAME}" multiping-linux-x86_64.tar.gz --clobber
+
+  build-macos:
+    name: MultiPing.app (arm64 + x86_64, macOS 11+)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        run: ./build_macos.sh
+
+      - name: Check
+        run: |
+          lipo -archs MultiPing.app/Contents/MacOS/MultiPing
+          otool -L MultiPing.app/Contents/MacOS/MultiPing
+          codesign --verify --strict --verbose=2 MultiPing.app
+
+      # ditto keeps the bundle's structure and its ad-hoc signature intact.
+      - name: Package
+        run: ditto -c -k --keepParent MultiPing.app MultiPing-macos.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: MultiPing-macos
+          path: MultiPing-macos.zip
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 \
+            || gh release create "${GITHUB_REF_NAME}" --title "MultiPing ${GITHUB_REF_NAME}" --generate-notes \
+            || true
+          gh release upload "${GITHUB_REF_NAME}" MultiPing-macos.zip --clobber
