@@ -17,12 +17,12 @@ with the same look everywhere and no extra dependencies.
 
 | | Runs on | Built with | Size |
 |---|---|---|---|
-| `MultiPing.exe` | 64-bit Windows 7 SP1 and later | MSVC 14.44, current UCRT, static | about 303 KB |
-| `MultiPingXP.exe` | 32- and 64-bit Windows XP SP3 and later | MinGW-w64 GCC (MSYS2 mingw32), msvcrt.dll | about 505 KB |
-| `multiping-gtk` | Linux with GTK 3: Debian 12, Ubuntu 24.04 and later | g++ in Debian bookworm | about 152 KB |
-| `multiping-qt5` | Linux with Qt 5.15 | g++ in Debian bookworm | about 168 KB |
-| `multiping-qt6` | Linux with Qt 6.4 or later | g++ in Debian bookworm | about 172 KB |
-| `MultiPing.app` | macOS 11 and later, Apple silicon and Intel | Apple clang, AppKit | about 360 KB |
+| `MultiPing.exe` | 64-bit Windows 7 SP1 and later | MSVC 14.44, current UCRT, static | about 313 KB |
+| `MultiPingXP.exe` | 32- and 64-bit Windows XP SP3 and later | MinGW-w64 GCC (MSYS2 mingw32), msvcrt.dll | about 521 KB |
+| `multiping-gtk` | Linux with GTK 3: Debian 12, Ubuntu 24.04 and later | g++ in Debian bookworm | about 164 KB |
+| `multiping-qt5` | Linux with Qt 5.15 | g++ in Debian bookworm | about 176 KB |
+| `multiping-qt6` | Linux with Qt 6.4 or later | g++ in Debian bookworm | about 180 KB |
+| `MultiPing.app` | macOS 11 and later, Apple silicon and Intel | Apple clang, AppKit | about 408 KB |
 
 The two Windows builds behave identically; every version-dependent feature is resolved at runtime,
 and the XP build is the more portable of the two. On Linux, pick the kit the desktop uses: GTK on
@@ -31,14 +31,18 @@ GNOME, Qt on KDE.
 ## Usage
 
 - Type a host name or IPv4/IPv6 address into a row and press Enter (or click elsewhere) to start pinging it.
+- The Notes box beside it takes a name or anything else worth knowing about the host.
 - The list always ends with an empty row for the next address. Filling it in adds another empty row below.
-- Enter moves to the next row; Tab / Shift+Tab move between rows.
-- Escape reverts an edited address box. The red circle at the right deletes the row.
+- Enter moves to the next row's address; Tab / Shift+Tab move through the boxes, the address then the notes.
+- Escape reverts an edited box. The red circle at the right deletes the row.
+- Drag the dots at a row's left up or down to move the row; dragged above or below the rows shown, the
+  list scrolls along.
 - Stats (min / median / avg / max) cover the whole session for that address; the graph shows the last 60 pings,
   one per second, with timeouts drawn in red.
 - The window opens sized for 8 rows; a scrollbar appears only when there are more.
-- Addresses are saved to `addresses.txt` on every change and on exit, in `%APPDATA%\MultiPing` on Windows,
-  `~/.config/MultiPing` on Linux and `~/Library/Application Support/MultiPing` on macOS.
+- The rows are saved to `addresses.txt` on every change and on exit, in `%APPDATA%\MultiPing` on Windows,
+  `~/.config/MultiPing` on Linux and `~/Library/Application Support/MultiPing` on macOS: a line per row,
+  the address, then a tab and the notes when there are any.
 - The window size and position are saved to `window.txt` in the same folder and restored on the next
   start, clamped to the current screen if the display layout has changed. Under Wayland only the size is
   restored, as the window system places windows itself.

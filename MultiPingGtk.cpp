@@ -48,8 +48,9 @@ static const Metrics M(96);
 
 struct Row {
     int id;
-    std::string addr;
+    std::string addr, notes;
     GtkWidget* entry;
+    GtkWidget* notesEntry;
     std::unique_ptr<Pinger> pinger;
     Stats stats;
 };
@@ -64,6 +65,11 @@ static int g_nextId = 1;
 static int g_first;           // index of the first visible row (row-based scrolling)
 static int g_hover = -1;      // the row whose delete button the pointer is over
 static int g_down = -1;       // the row whose delete button is pressed
+static int g_gripHover = -1;  // the row whose handle the pointer is over
+static Row* g_dragRow;        // the row being moved by its handle
+static bool g_dragMoved;      // and whether it has left its place
+static int g_dragY;           // the pointer's height while it is
+static guint g_dragTimer;     // scrolls the list while the pointer is above or below the rows shown
 static double g_wheel;
 static bool g_closing;
 static bool g_sized;          // the window's content made the size asked for, once
@@ -221,7 +227,8 @@ static void UpdateScroll(bool relayout = true)
     gtk_adjustment_configure(g_adjust, g_first, 0, n, 1, fit, fit);
     for (size_t i = 0; i < g_rows.size(); i++) {
         bool shown = (int)i >= g_first && (int)i < g_first + fit;
-        if (shown != (bool)gtk_widget_get_child_visible(g_rows[i]->entry)) gtk_widget_set_child_visible(g_rows[i]->entry, shown);
+        for (GtkWidget* entry : { g_rows[i]->entry, g_rows[i]->notesEntry })
+            if (shown != (bool)gtk_widget_get_child_visible(entry)) gtk_widget_set_child_visible(entry, shown);
     }
     if (relayout) Relayout();
 }
@@ -241,8 +248,8 @@ static void EnsureRowVisible(int i)
     else if (i >= g_first + fit) SetFirstRow(i - fit + 1);
 }
 
-// Where the overlay puts its children: each address box in its row's cell, the scrollbar along
-// the right edge.
+// Where the overlay puts its children: each address and notes box in its row's cell, the
+// scrollbar along the right edge.
 static gboolean OnChildPosition(GtkOverlay*, GtkWidget* child, GdkRectangle* a, gpointer)
 {
     if (child == g_bar) {
@@ -254,10 +261,12 @@ static gboolean OnChildPosition(GtkOverlay*, GtkWidget* child, GdkRectangle* a, 
     }
     Cols c = M.Columns(ClientWidth());
     for (size_t i = 0; i < g_rows.size(); i++) {
-        if (g_rows[i]->entry != child) continue;
+        if (g_rows[i]->entry != child && g_rows[i]->notesEntry != child) continue;
+        // A hidden box goes below the rows shown: the overlay keeps a window for it there, which
+        // would take the clicks meant for the box it lay over.
         int slot = (int)i - g_first;
-        if (slot < 0 || slot >= Fit()) slot = 0;   // hidden; anywhere will do
-        Rect r = M.Cell(c, C_ADDR, M.RowTop(slot));
+        Rect r = M.Cell(c, child == g_rows[i]->entry ? C_ADDR : C_NOTES, M.RowTop(slot));
+        if (slot < 0 || slot >= Fit()) r.y = ClientHeight() + M.S(ROW_H);
         a->x = r.x; a->y = r.y; a->width = r.w; a->height = r.h;
         return TRUE;
     }
@@ -273,25 +282,32 @@ static Row* FindRow(int id)
     for (auto& r : g_rows) if (r->id == id) return r.get();
     return NULL;
 }
-static size_t IndexOf(GtkWidget* entry)
+// The row an address or notes box belongs to, and which of the two it is.
+static size_t IndexOf(GtkWidget* entry, bool* notes = NULL)
 {
-    for (size_t i = 0; i < g_rows.size(); i++) if (g_rows[i]->entry == entry) return i;
+    for (size_t i = 0; i < g_rows.size(); i++) {
+        if (g_rows[i]->entry != entry && g_rows[i]->notesEntry != entry) continue;
+        if (notes) *notes = g_rows[i]->notesEntry == entry;
+        return i;
+    }
     return (size_t)-1;
 }
 
 static void Save()
 {
-    std::vector<std::string> addrs;
-    for (auto& r : g_rows) addrs.push_back(r->addr);
-    SaveAddresses(addrs);
+    std::vector<Entry> entries;
+    for (auto& r : g_rows) entries.push_back(Entry{ r->addr, r->notes });
+    SaveEntries(entries);
 }
 
-static void FocusEdit(size_t i)
+// Puts the caret in row i's address box, or its notes box, with the text selected.
+static void FocusEdit(size_t i, bool notes = false)
 {
     if (i >= g_rows.size()) return;
     EnsureRowVisible((int)i);
-    gtk_widget_grab_focus(g_rows[i]->entry);
-    gtk_editable_select_region(GTK_EDITABLE(g_rows[i]->entry), 0, -1);
+    GtkWidget* entry = notes ? g_rows[i]->notesEntry : g_rows[i]->entry;
+    gtk_widget_grab_focus(entry);
+    gtk_editable_select_region(GTK_EDITABLE(entry), 0, -1);
 }
 
 // Reads the box into the row; restarts pinging if the address changed. True if it did.
@@ -307,16 +323,30 @@ static bool ApplyEdit(Row* r)
     return true;
 }
 
+// Reads the notes box into the row, and saves when they changed. True if they did.
+static bool ApplyNotes(Row* r)
+{
+    std::string n = OneLine(gtk_entry_get_text(GTK_ENTRY(r->notesEntry)));
+    if (n == r->notes) return false;
+    r->notes = n;
+    Save();
+    return true;
+}
+
 static void EnsureTrailingEmptyRow();
 
 static gboolean OnEntryKey(GtkWidget* entry, GdkEventKey* e, gpointer)
 {
-    size_t i = IndexOf(entry);
+    bool notes = false;
+    size_t i = IndexOf(entry, &notes);
     if (i == (size_t)-1 || g_closing) return FALSE;
+    size_t n = 2 * g_rows.size(), f = 2 * i + (notes ? 1 : 0);   // the boxes in reading order
     switch (e->keyval) {
     case GDK_KEY_Return:
     case GDK_KEY_KP_Enter:
-        ApplyEdit(g_rows[i].get());
+        // From either box, on to the next row's address.
+        if (notes) ApplyNotes(g_rows[i].get());
+        else ApplyEdit(g_rows[i].get());
         EnsureTrailingEmptyRow();              // a filled-in last row gets a fresh empty row after it
         if (i + 1 < g_rows.size()) FocusEdit(i + 1);
         return TRUE;
@@ -324,43 +354,58 @@ static gboolean OnEntryKey(GtkWidget* entry, GdkEventKey* e, gpointer)
     case GDK_KEY_KP_Tab:
     case GDK_KEY_ISO_Left_Tab: {
         bool back = e->keyval == GDK_KEY_ISO_Left_Tab || (e->state & GDK_SHIFT_MASK);
-        FocusEdit(back ? (i + g_rows.size() - 1) % g_rows.size() : (i + 1) % g_rows.size());
+        f = back ? (f + n - 1) % n : (f + 1) % n;
+        FocusEdit(f / 2, f % 2 == 1);
         return TRUE;
     }
     case GDK_KEY_Escape:
-        gtk_entry_set_text(GTK_ENTRY(entry), g_rows[i]->addr.c_str());
+        gtk_entry_set_text(GTK_ENTRY(entry), (notes ? g_rows[i]->notes : g_rows[i]->addr).c_str());
         return TRUE;
     }
     return FALSE;
 }
 
-static gboolean ApplyLater(gpointer id)
+// The box that lost the focus, as twice its row's id, plus one for the notes box.
+static gboolean ApplyLater(gpointer box)
 {
-    Row* r = FindRow(GPOINTER_TO_INT(id));
-    if (r && !g_closing && ApplyEdit(r)) EnsureTrailingEmptyRow();
+    int b = GPOINTER_TO_INT(box);
+    Row* r = FindRow(b / 2);
+    if (!r || g_closing) return G_SOURCE_REMOVE;
+    if (b % 2) ApplyNotes(r);
+    else if (ApplyEdit(r)) EnsureTrailingEmptyRow();
     return G_SOURCE_REMOVE;
 }
 
 static gboolean OnEntryFocusOut(GtkWidget* entry, GdkEvent*, gpointer)
 {
-    size_t i = IndexOf(entry);
-    if (i != (size_t)-1 && !g_closing) g_idle_add(ApplyLater, GINT_TO_POINTER(g_rows[i]->id));
+    bool notes = false;
+    size_t i = IndexOf(entry, &notes);
+    if (i != (size_t)-1 && !g_closing) g_idle_add(ApplyLater, GINT_TO_POINTER(2 * g_rows[i]->id + (notes ? 1 : 0)));
     return FALSE;
 }
 
-static Row* AddRow(const std::string& addr)
+// An address or notes box: Enter, Tab and Escape handled by OnEntryKey.
+static GtkWidget* MakeEntry(const std::string& text)
+{
+    GtkWidget* entry = gtk_entry_new();
+    gtk_entry_set_text(GTK_ENTRY(entry), text.c_str());
+    gtk_style_context_add_class(gtk_widget_get_style_context(entry), "multiping");
+    g_signal_connect(entry, "key-press-event", G_CALLBACK(OnEntryKey), NULL);
+    g_signal_connect(entry, "focus-out-event", G_CALLBACK(OnEntryFocusOut), NULL);
+    gtk_overlay_add_overlay(GTK_OVERLAY(g_overlay), entry);
+    gtk_widget_show(entry);
+    return entry;
+}
+
+static Row* AddRow(const std::string& addr, const std::string& notes)
 {
     std::unique_ptr<Row> r(new Row);
     r->id = g_nextId++;
     r->addr = addr;
-    r->entry = gtk_entry_new();
-    gtk_entry_set_text(GTK_ENTRY(r->entry), addr.c_str());
+    r->notes = notes;
+    r->entry = MakeEntry(addr);
     gtk_entry_set_placeholder_text(GTK_ENTRY(r->entry), kCue);
-    gtk_style_context_add_class(gtk_widget_get_style_context(r->entry), "multiping");
-    g_signal_connect(r->entry, "key-press-event", G_CALLBACK(OnEntryKey), NULL);
-    g_signal_connect(r->entry, "focus-out-event", G_CALLBACK(OnEntryFocusOut), NULL);
-    gtk_overlay_add_overlay(GTK_OVERLAY(g_overlay), r->entry);
-    gtk_widget_show(r->entry);
+    r->notesEntry = MakeEntry(notes);
     if (!addr.empty()) r->pinger.reset(new Pinger(addr));
     g_rows.push_back(std::move(r));
     return g_rows.back().get();
@@ -370,22 +415,23 @@ static Row* AddRow(const std::string& addr)
 static void EnsureTrailingEmptyRow()
 {
     if (g_rows.empty() || !g_rows.back()->addr.empty()) {
-        AddRow("");
+        AddRow("", "");
         UpdateScroll();
     }
 }
 
 static gboolean DeleteLater(gpointer id)
 {
-    if (g_closing) return G_SOURCE_REMOVE;
+    if (g_closing || g_dragRow) return G_SOURCE_REMOVE;
     size_t i = 0;
     while (i < g_rows.size() && g_rows[i]->id != GPOINTER_TO_INT(id)) i++;
     if (i == g_rows.size()) return G_SOURCE_REMOVE;
-    GtkWidget* entry = g_rows[i]->entry;
-    g_signal_handlers_disconnect_by_func(entry, (gpointer)OnEntryFocusOut, NULL);   // its focus loss is no edit
+    GtkWidget* entries[2] = { g_rows[i]->entry, g_rows[i]->notesEntry };
+    for (GtkWidget* entry : entries)   // their focus loss is no edit
+        g_signal_handlers_disconnect_by_func(entry, (gpointer)OnEntryFocusOut, NULL);
     g_rows.erase(g_rows.begin() + (long)i);
-    gtk_widget_destroy(entry);
-    g_hover = -1;
+    for (GtkWidget* entry : entries) gtk_widget_destroy(entry);
+    g_hover = g_gripHover = -1;
     EnsureTrailingEmptyRow();
     Save();
     UpdateScroll();
@@ -453,6 +499,15 @@ static void PaintGraph(cairo_t* cr, const Rect& box, const Stats& s, const Palet
     cairo_rectangle(cr, 0.5, 0.5, box.w - 1, box.h - 1);
     cairo_stroke(cr);
     cairo_restore(cr);
+}
+
+// The handle's six dots.
+static void PaintGrip(cairo_t* cr, const Rect& box, const Rgb& colour)
+{
+    GripDots g = LayoutGrip(M, box);
+    SetColour(cr, colour);
+    for (const Rect& d : g.dot) cairo_rectangle(cr, d.x, d.y, d.w, d.h);
+    cairo_fill(cr);
 }
 
 // Red filled circle with a white X, antialiased.
@@ -545,7 +600,7 @@ static gboolean OnDraw(GtkWidget* area, cairo_t* cr, gpointer)
     cairo_rectangle(cr, c.x[0], y + M.S(HDR_H), c.x[NCOL - 1] + c.w[NCOL - 1] - c.x[0], 1);
     cairo_fill(cr);
 
-    // The visible rows: labels, graph, delete button; the address boxes are widgets of their own.
+    // The visible rows: handle, labels, graph, delete button; the boxes are widgets of their own.
     int fit = Fit();
     for (int slot = 0; slot < fit && g_first + slot < (int)g_rows.size(); slot++) {
         const Row& r = *g_rows[(size_t)(g_first + slot)];
@@ -557,6 +612,10 @@ static gboolean OnDraw(GtkWidget* area, cairo_t* cr, gpointer)
         for (int k = C_CUR; k <= C_MAX; k++) DrawText(cr, font, labels[k - C_CUR].c_str(), M.Cell(c, k, top), true, true);
         PaintGraph(cr, M.Cell(c, C_GRAPH, top), r.stats, P);
         int i = g_first + slot;
+        if (i + 1 < (int)g_rows.size()) {   // the empty row at the end has no handle: it stays last
+            bool active = g_dragRow ? g_dragRow == g_rows[(size_t)i].get() : i == g_gripHover;
+            PaintGrip(cr, M.Cell(c, C_GRIP, top), active ? P.gripActive : P.grip);
+        }
         PaintDelete(cr, M.Cell(c, C_DEL, top), i == g_down ? P.delDown : i == g_hover ? P.delHover : P.del);
     }
     pango_font_description_free(font);
@@ -578,25 +637,99 @@ static int DeleteAt(double x, double y)
     return -1;
 }
 
-static void SetHover(int over)
+// The visible row whose handle is at (x, y), or -1. The empty row at the end has none.
+static int GripAt(double x, double y)
 {
-    if (over == g_hover) return;
-    g_hover = over;
+    Cols c = M.Columns(ClientWidth());
+    for (int slot = 0; slot < Fit() && g_first + slot + 1 < (int)g_rows.size(); slot++) {
+        Rect g = M.Cell(c, C_GRIP, M.RowTop(slot));
+        if (x >= g.x && x < g.x + g.w && y >= g.y && y < g.y + g.h) return g_first + slot;
+    }
+    return -1;
+}
+
+static void SetCursor(const char* name)
+{
     GdkWindow* w = gtk_widget_get_window(g_area);
-    GdkCursor* hand = over >= 0 ? gdk_cursor_new_from_name(gdk_window_get_display(w), "pointer") : NULL;
-    gdk_window_set_cursor(w, hand);
-    if (hand) g_object_unref(hand);
+    GdkCursor* cursor = name ? gdk_cursor_new_from_name(gdk_window_get_display(w), name) : NULL;
+    gdk_window_set_cursor(w, cursor);
+    if (cursor) g_object_unref(cursor);
+}
+
+// The pointer over a delete button or a handle, or neither (-1): the hand that goes with it.
+static void SetHover(int over, int grip)
+{
+    if (over == g_hover && grip == g_gripHover) return;
+    g_hover = over;
+    g_gripHover = grip;
+    SetCursor(over >= 0 ? "pointer" : grip >= 0 ? "grab" : NULL);
     gtk_widget_queue_draw(g_area);
 }
 
-static gboolean OnMotion(GtkWidget*, GdkEventMotion* e, gpointer) { SetHover(DeleteAt(e->x, e->y)); return TRUE; }
-static gboolean OnLeave(GtkWidget*, GdkEventCrossing*, gpointer) { SetHover(-1); return TRUE; }
+static gboolean DragTick(gpointer);
+
+// Moves the row being dragged to where the pointer is, scrolling the list a row when `scroll` is
+// set (the timer's tick), and keeps the timer running while the pointer is above or below the
+// rows shown.
+static void DragTo(bool scroll)
+{
+    if (!g_dragRow) return;
+    int n = (int)g_rows.size(), fit = Fit(), first = g_first;
+    size_t from = 0;
+    while (g_rows[from].get() != g_dragRow) from++;
+    int to = DragTarget(M, g_dragY, &first, fit, n, n - 1, scroll);
+    bool moved = to != (int)from, scrolled = first != g_first;
+    if (moved) { MoveItem(g_rows, from, (size_t)to); g_dragMoved = true; }
+    if (scrolled) g_first = first;
+    if (moved || scrolled) UpdateScroll();
+    if (!DragOutside(M, g_dragY, fit)) {
+        if (g_dragTimer) { g_source_remove(g_dragTimer); g_dragTimer = 0; }
+    } else if (!g_dragTimer) {
+        g_dragTimer = g_timeout_add(DRAG_SCROLL_MS, DragTick, NULL);
+    }
+}
+
+static gboolean DragTick(gpointer)
+{
+    DragTo(true);
+    return G_SOURCE_CONTINUE;
+}
+
+static void EndDrag()
+{
+    g_dragRow = NULL;
+    if (g_dragTimer) { g_source_remove(g_dragTimer); g_dragTimer = 0; }
+    gtk_widget_queue_draw(g_area);
+    if (g_dragMoved) Save();
+}
+
+static gboolean OnMotion(GtkWidget*, GdkEventMotion* e, gpointer)
+{
+    if (g_dragRow) { g_dragY = (int)e->y; DragTo(false); }
+    else SetHover(DeleteAt(e->x, e->y), GripAt(e->x, e->y));
+    return TRUE;
+}
+static gboolean OnLeave(GtkWidget*, GdkEventCrossing*, gpointer)
+{
+    if (!g_dragRow) SetHover(-1, -1);
+    return TRUE;
+}
 
 // GTK under Wayland can hand a press and a release over twice: a delete happens only on the
 // release that ends the press of the same button.
 static gboolean OnPress(GtkWidget*, GdkEventButton* e, gpointer)
 {
-    if (e->type != GDK_BUTTON_PRESS || e->button != 1) return FALSE;
+    if (e->type != GDK_BUTTON_PRESS || e->button != 1 || g_dragRow) return FALSE;
+    int grip = GripAt(e->x, e->y);
+    if (grip >= 0) {
+        // A row's handle: the row follows the pointer up and down until the button goes up.
+        g_dragRow = g_rows[(size_t)grip].get();
+        g_dragMoved = false;
+        g_dragY = (int)e->y;
+        SetCursor("grabbing");
+        gtk_widget_queue_draw(g_area);
+        return TRUE;
+    }
     g_down = DeleteAt(e->x, e->y);
     if (g_down >= 0) gtk_widget_queue_draw(g_area);
     return g_down >= 0;
@@ -604,7 +737,16 @@ static gboolean OnPress(GtkWidget*, GdkEventButton* e, gpointer)
 
 static gboolean OnRelease(GtkWidget*, GdkEventButton* e, gpointer)
 {
-    if (e->button != 1 || g_down < 0) return FALSE;
+    if (e->button != 1) return FALSE;
+    if (g_dragRow) {
+        g_dragY = (int)e->y;   // the release can bring the pointer's last move with it
+        DragTo(false);
+        EndDrag();
+        g_hover = g_gripHover = -2;   // so that SetHover sets the cursor again
+        SetHover(DeleteAt(e->x, e->y), GripAt(e->x, e->y));
+        return TRUE;
+    }
+    if (g_down < 0) return FALSE;
     int pressed = g_down;
     g_down = -1;
     gtk_widget_queue_draw(g_area);
@@ -657,6 +799,10 @@ static void OnAreaAllocate(GtkWidget*, GdkRectangle* a, gpointer)
 static gboolean OnDelete(GtkWidget*, GdkEvent*, gpointer)
 {
     g_closing = true;
+    for (auto& r : g_rows) {   // what the boxes hold, edited or not
+        r->addr = Trim(gtk_entry_get_text(GTK_ENTRY(r->entry)));
+        r->notes = OneLine(gtk_entry_get_text(GTK_ENTRY(r->notesEntry)));
+    }
     int x = 0, y = 0;
     gtk_window_get_position(GTK_WINDOW(g_window), &x, &y);   // 0, 0 under Wayland, which never says
     WindowRect r = { x, y, gtk_widget_get_allocated_width(g_area), gtk_widget_get_allocated_height(g_area) };
@@ -721,7 +867,7 @@ int main(int argc, char** argv)
     g_bar = gtk_scrollbar_new(GTK_ORIENTATION_VERTICAL, g_adjust);
     gtk_overlay_add_overlay(GTK_OVERLAY(g_overlay), g_bar);
 
-    for (const std::string& a : LoadAddresses()) AddRow(a);
+    for (const Entry& e : LoadEntries()) AddRow(e.addr, e.notes);
     EnsureTrailingEmptyRow();
 
     int barMin = 0, barNat = 0;
@@ -735,6 +881,7 @@ int main(int argc, char** argv)
     g_wantH = M.ContentHeightFor(DEFAULT_ROWS);
     bool placed = false;
     if (LoadWindowRect(&r)) {
+        r.w = FitSavedWidth(r.w, M.MinContentWidth() + barNat, M.DefaultWidth());
         GdkDisplay* display = gdk_display_get_default();
         GdkMonitor* monitor = gdk_display_get_monitor_at_point(display, (int)(r.x + r.w / 2), (int)(r.y + r.h / 2));
         if (!monitor) monitor = gdk_display_get_primary_monitor(display);

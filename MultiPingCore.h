@@ -50,6 +50,7 @@ enum {
     RING_N           = 60,     // seconds of history shown in the graph
     PING_INTERVAL_MS = 1000,   // UI tick: commits last results and releases the next round of pings
     PING_TIMEOUT_MS  = 800,    // under the interval; a result not back by the tick counts as a timeout
+    DRAG_SCROLL_MS   = 100,    // a row dragged above or below the rows shown scrolls the list a row this often
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -75,23 +76,27 @@ enum {
     TITLE_ICON_PX = 36,    // the app icon drawn beside the title where no emoji font exists
     TITLE_EMOJI_PX  = 35,  // the title emoji's height, as Windows draws it beside the 24 pt title,
     TITLE_EMOJI_GAP = 14,  // from the title's end, its middle a pixel above the capitals' middle
-    W_ADDR        = 290,
+    W_GRIP        = 16,    // the handle that moves a row up and down
+    W_ADDR        = 193,
+    W_NOTES       = 180,
     W_CUR         = 110,
     W_STAT        = 92,
-    W_GRAPH_MIN   = 240,
+    W_GRAPH_MIN   = 200,
     GRAPH_GAP     = 28,    // extra space between the Max column and the graph
     DEL_GAP       = 10,    // extra space between the graph and the delete button
     W_DEL         = 24,
-    W_EXTRA       = 95,    // the first window's width beyond the minimum: a graph about 335 px wide
+    W_EXTRA       = 135,   // the first window's width beyond the minimum: a graph about 335 px wide
+    GRIP_DOT      = 3,     // the handle's six dots, two across and three down,
+    GRIP_PITCH    = 6,     // this far apart
     DEFAULT_ROWS  = 8,     // the first window fits this many rows
     MIN_ROWS      = 2,     // the window is never made shorter than this many
 };
 
-enum { C_ADDR, C_CUR, C_MIN, C_MED, C_AVG, C_MAX, C_GRAPH, C_DEL, NCOL };
-static const int kColBase[NCOL] = { W_ADDR, W_CUR, W_STAT, W_STAT, W_STAT, W_STAT, W_GRAPH_MIN, W_DEL };
-static const char* const kColNames[NCOL] = { "Address", "Current", "Min", "Median", "Avg", "Max", "Last 60 s", "" };
+enum { C_GRIP, C_ADDR, C_NOTES, C_CUR, C_MIN, C_MED, C_AVG, C_MAX, C_GRAPH, C_DEL, NCOL };
+static const int kColBase[NCOL] = { W_GRIP, W_ADDR, W_NOTES, W_CUR, W_STAT, W_STAT, W_STAT, W_STAT, W_GRAPH_MIN, W_DEL };
+static const char* const kColNames[NCOL] = { "", "Address", "Notes", "Current", "Min", "Median", "Avg", "Max", "Last 60 s", "" };
 // Columns whose header and values are left aligned; the rest are right aligned.
-inline bool LeftAligned(int col) { return col == C_ADDR || col == C_GRAPH; }
+inline bool LeftAligned(int col) { return col == C_ADDR || col == C_NOTES || col == C_GRAPH; }
 
 struct Rgb { unsigned char r, g, b; };
 
@@ -110,16 +115,19 @@ struct Palette {
     Rgb headerLine;
     Rgb infoText;
     Rgb del, delHover, delDown;
+    Rgb grip, gripActive;  // a row's handle, and the one under the pointer or being dragged
 };
 static const Palette kLight = {
     { 255, 255, 255 }, { 228, 228, 228 }, { 58, 128, 214 }, { 255, 214, 214 }, { 222, 54, 54 },
     { 110, 110, 110 }, { 160, 160, 160 }, { 170, 170, 170 }, { 80, 80, 80 },
     { 214, 44, 44 }, { 240, 70, 70 }, { 170, 30, 30 },
+    { 168, 168, 168 }, { 96, 96, 96 },
 };
 static const Palette kDark = {
     { 20, 20, 20 }, { 48, 48, 48 }, { 58, 128, 214 }, { 84, 30, 32 }, { 222, 54, 54 },
     { 150, 150, 150 }, { 96, 96, 96 }, { 84, 84, 84 }, { 175, 175, 175 },
     { 214, 44, 44 }, { 240, 70, 70 }, { 170, 30, 30 },
+    { 100, 100, 100 }, { 196, 196, 196 },
 };
 inline const Palette& PaletteFor(bool dark) { return dark ? kDark : kLight; }
 
@@ -297,6 +305,42 @@ inline int ClampFirstRow(int first, int rows, int fit)
 }
 
 // ---------------------------------------------------------------------------------------------
+// Moving a row by its handle
+// ---------------------------------------------------------------------------------------------
+
+// While a row is dragged by its handle it moves, as the pointer goes, to where the row under the
+// pointer is: DragTarget is that row's index for a pointer at y, among the first `movable` of the
+// `rows` rows (the empty row at the end stays last). Above or below the rows shown, it is the
+// first or the last row shown, and with `scroll` set the list also moves a row towards the
+// pointer: the front ends set it on a timer's tick while the pointer stays out there.
+inline bool DragOutside(const Metrics& M, int y, int fit)
+{
+    return y < M.RowsTop() || y >= M.RowTop(fit);
+}
+
+inline int DragTarget(const Metrics& M, int y, int* first, int fit, int rows, int movable, bool scroll)
+{
+    int t;
+    if (y < M.RowsTop()) {
+        if (scroll && *first > 0) (*first)--;
+        t = *first;
+    } else if (y >= M.RowTop(fit)) {
+        if (scroll) *first = ClampFirstRow(*first + 1, rows, fit);
+        t = *first + fit - 1;
+    } else {
+        t = *first + (y - M.RowsTop()) / M.S(ROW_H);
+    }
+    return t < movable - 1 ? t : movable - 1;
+}
+
+// Moves v[from] to index `to`; the items between close up behind it.
+template <class T> void MoveItem(std::vector<T>& v, size_t from, size_t to)
+{
+    if (from < to) std::rotate(v.begin() + (long)from, v.begin() + (long)from + 1, v.begin() + (long)to + 1);
+    else if (to < from) std::rotate(v.begin() + (long)to, v.begin() + (long)from, v.begin() + (long)from + 1);
+}
+
+// ---------------------------------------------------------------------------------------------
 // The graph
 // ---------------------------------------------------------------------------------------------
 
@@ -367,8 +411,24 @@ inline DeleteGlyph LayoutDelete(float W, float H)
     return d;
 }
 
+// The handle's six square dots, two across and three down, centred in its box.
+struct GripDots { Rect dot[6]; };
+
+inline GripDots LayoutGrip(const Metrics& M, const Rect& box)
+{
+    GripDots g;
+    int d = M.S(GRIP_DOT), pitch = M.S(GRIP_PITCH);
+    int x0 = box.x + (box.w - pitch - d) / 2, y0 = box.y + (box.h - 2 * pitch - d) / 2;
+    for (int i = 0; i < 6; i++) {
+        Rect r = { x0 + (i % 2) * pitch, y0 + (i / 2) * pitch, d, d };
+        g.dot[i] = r;
+    }
+    return g;
+}
+
 // ---------------------------------------------------------------------------------------------
-// The files: addresses.txt (UTF-8, one address per line) and window.txt ("left top width height")
+// The files: addresses.txt (UTF-8, a row per line: the address, and after a tab the row's notes)
+// and window.txt ("left top width height")
 // ---------------------------------------------------------------------------------------------
 
 inline bool IsSpace(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f'; }
@@ -381,27 +441,47 @@ inline std::string Trim(const std::string& s)
     return s.substr(a, b - a);
 }
 
-// The addresses in a file's bytes: one per line, blank lines and surrounding space left out.
-inline std::vector<std::string> ParseAddresses(const std::string& bytes)
+// A row as addresses.txt keeps it.
+struct Entry { std::string addr, notes; };
+
+// Text as a line of the file can hold it: tabs and line breaks become spaces, and the space at
+// either end goes.
+inline std::string OneLine(std::string s)
 {
-    std::vector<std::string> out;
+    for (char& c : s) if (c == '\t' || c == '\r' || c == '\n') c = ' ';
+    return Trim(s);
+}
+
+// The rows in a file's bytes, a line each: the address, then a tab and the notes when there are
+// any (a file from before the notes has addresses alone). Blank lines are left out.
+inline std::vector<Entry> ParseEntries(const std::string& bytes)
+{
+    std::vector<Entry> out;
     size_t start = 0;
     while (start <= bytes.size()) {
         size_t nl = bytes.find('\n', start);
         if (nl == std::string::npos) nl = bytes.size();
-        std::string line = Trim(bytes.substr(start, nl - start));
+        std::string line = bytes.substr(start, nl - start);
         start = nl + 1;
-        if (!line.empty()) out.push_back(line);
+        size_t tab = line.find('\t');
+        Entry e = { Trim(line.substr(0, tab)), tab == std::string::npos ? std::string() : OneLine(line.substr(tab + 1)) };
+        if (!e.addr.empty() || !e.notes.empty()) out.push_back(e);
     }
     return out;
 }
 
-// A file's bytes for the addresses, each followed by eol ("\r\n" on Windows, "\n" elsewhere);
-// empty ones are left out.
-inline std::string JoinAddresses(const std::vector<std::string>& addrs, const char* eol)
+// A file's bytes for the rows, each line followed by eol ("\r\n" on Windows, "\n" elsewhere);
+// rows with neither an address nor notes are left out.
+inline std::string JoinEntries(const std::vector<Entry>& rows, const char* eol)
 {
     std::string bytes;
-    for (const std::string& a : addrs) if (!a.empty()) { bytes += a; bytes += eol; }
+    for (const Entry& e : rows) {
+        std::string notes = OneLine(e.notes);
+        if (e.addr.empty() && notes.empty()) continue;
+        bytes += e.addr;
+        if (!notes.empty()) { bytes += '\t'; bytes += notes; }
+        bytes += eol;
+    }
     return bytes;
 }
 
@@ -423,6 +503,9 @@ inline std::string FormatWindowRect(const WindowRect& r, const char* eol)
     snprintf(b, sizeof b, "%ld %ld %ld %ld%s", r.x, r.y, r.w, r.h, eol);
     return b;
 }
+
+// A saved width too narrow for the columns, saved before one was added, gives way to the default.
+inline long FitSavedWidth(long w, long minW, long defaultW) { return w < minW ? defaultW : w; }
 
 // Makes the rectangle fit a work area, so that a changed screen layout or resolution never leaves
 // the window off screen or larger than the screen.

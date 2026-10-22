@@ -89,6 +89,7 @@ enum {
 };
 
 #define TIMER_TICK        1
+#define TIMER_DRAG        2   // scrolls the list while a row is dragged above or below the rows shown
 
 // Git short revision, passed in by build.bat as /DGIT_REV="abc1234".
 #ifndef GIT_REV
@@ -122,11 +123,18 @@ struct PingCtx {
 
 struct Row {
     int           id;
-    std::wstring  addr;
-    HWND          edit, cur, mn, med, avg, mx, graph, del;
+    std::wstring  addr, notes;
+    HWND          grip, edit, notesEdit, cur, mn, med, avg, mx, graph, del;
     PingCtx*      ctx;
     Stats         stats;
 };
+
+// A row's windows in column order.
+static void RowWindows(const Row* r, HWND ctl[NCOL])
+{
+    HWND all[NCOL] = { r->grip, r->edit, r->notesEdit, r->cur, r->mn, r->med, r->avg, r->mx, r->graph, r->del };
+    for (int k = 0; k < NCOL; k++) ctl[k] = all[k];
+}
 
 static HWND     g_hwnd;
 static HFONT    g_font, g_fontSmall, g_fontLogo, g_fontEmoji, g_fontInfo;
@@ -180,6 +188,9 @@ static int      g_firstRow;     // index of the first visible row (row-based scr
 static int      g_nextRowId = 1;
 static bool     g_closing;
 static std::vector<Row*> g_rows;
+static Row*     g_dragRow;      // the row being moved by its handle, or NULL
+static bool     g_dragMoved;    // and whether it has left its place
+static int      g_dragY;        // the pointer's height in the main window while it is
 static WNDPROC  g_oldEditProc;
 static UINT (WINAPI* g_pGetDpiForWindow)(HWND);
 
@@ -479,6 +490,11 @@ static bool LoadWindowRect(RECT* out)
     std::string text;
     WindowRect wr = { 0, 0, 0, 0 };
     if (!ReadWholeFile(ConfigDir(false) + L"\\window.txt", &text) || !ParseWindowRect(text, &wr)) return false;
+    RECT minR = { 0, 0, Mx().MinContentWidth() + GetSystemMetrics(SM_CXVSCROLL), 100 };
+    RECT defR = { 0, 0, Mx().DefaultWidth(), 100 };
+    AdjustWindowRectEx(&minR, WS_OVERLAPPEDWINDOW, FALSE, 0);
+    AdjustWindowRectEx(&defR, WS_OVERLAPPEDWINDOW, FALSE, 0);
+    wr.w = FitSavedWidth(wr.w, minR.right - minR.left, defR.right - defR.left);
     RECT r = { wr.x, wr.y, wr.x + wr.w, wr.y + wr.h };
     MONITORINFO mi = { sizeof mi };
     if (!GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mi)) return false;
@@ -488,19 +504,18 @@ static bool LoadWindowRect(RECT* out)
     return true;
 }
 
-static bool LoadAddresses(std::vector<std::wstring>& out)
+static std::vector<Entry> LoadEntries()
 {
     std::string bytes;
-    if (!ReadWholeFile(ConfigPath(false), &bytes)) return false;
-    for (const std::string& a : ParseAddresses(bytes)) out.push_back(Widen(a));
-    return true;
+    ReadWholeFile(ConfigPath(false), &bytes);
+    return ParseEntries(bytes);
 }
 
 static void SaveAddresses()
 {
-    std::vector<std::string> addrs;
-    for (Row* r : g_rows) addrs.push_back(Narrow(r->addr));
-    WriteWholeFile(ConfigPath(true), JoinAddresses(addrs, "\r\n"));
+    std::vector<Entry> rows;
+    for (Row* r : g_rows) rows.push_back(Entry{ Narrow(r->addr), Narrow(r->notes) });
+    WriteWholeFile(ConfigPath(true), JoinEntries(rows, "\r\n"));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -545,20 +560,23 @@ static void Layout()
     RECT rc; GetClientRect(g_hwnd, &rc);
     Cols c = ComputeCols(rc.right);
     int fit = RowsThatFit();
-    HDWP dwp = BeginDeferWindowPos((int)g_rows.size() * 8);
+    HDWP dwp = BeginDeferWindowPos((int)g_rows.size() * NCOL);
     LOG("Layout: rows=%d client=%dx%d fit=%d first=%d dpi=%u dwp=%p x0=%d w0=%d xg=%d wg=%d",
         (int)g_rows.size(), rc.right, rc.bottom, fit, g_firstRow, g_dpi, (void*)dwp, c.x[0], c.w[0], c.x[C_GRAPH], c.w[C_GRAPH]);
     for (size_t i = 0; i < g_rows.size(); i++) {
         Row* r = g_rows[i];
         bool shown = (int)i >= g_firstRow && (int)i < g_firstRow + fit;
         int y = Mx().RowTop((int)i - g_firstRow);
-        HWND ctl[NCOL] = { r->edit, r->cur, r->mn, r->med, r->avg, r->mx, r->graph, r->del };
+        HWND ctl[NCOL];
+        RowWindows(r, ctl);
         for (int k = 0; k < NCOL; k++) {
             Rect cell = Mx().Cell(c, k, y);
             // Show/hide is done separately: DeferWindowPos may not move or size a window in the
             // same call that shows or hides it (Windows XP enforces this; later versions do not).
-            if (shown != (IsWindowVisible(ctl[k]) != FALSE))
-                ShowWindow(ctl[k], shown ? SW_SHOWNA : SW_HIDE);
+            // The empty row at the end has no handle: it stays last.
+            bool show = shown && (k != C_GRIP || i + 1 < g_rows.size());
+            if (show != (IsWindowVisible(ctl[k]) != FALSE))
+                ShowWindow(ctl[k], show ? SW_SHOWNA : SW_HIDE);
             dwp = DeferWindowPos(dwp, ctl[k], NULL, cell.x, cell.y, cell.w, cell.h, SWP_NOZORDER | SWP_NOACTIVATE);
             if (!dwp) LOG("  DeferWindowPos failed row=%d col=%d hwnd=%p err=%lu", (int)i, k, (void*)ctl[k], GetLastError());
         }
@@ -605,9 +623,14 @@ static Row* FindRowById(int id)
     for (Row* r : g_rows) if (r->id == id) return r;
     return NULL;
 }
-static size_t IndexOfEdit(HWND edit)
+// The row an address or notes box belongs to, and which of the two it is.
+static size_t IndexOfEdit(HWND edit, bool* notes = NULL)
 {
-    for (size_t i = 0; i < g_rows.size(); i++) if (g_rows[i]->edit == edit) return i;
+    for (size_t i = 0; i < g_rows.size(); i++) {
+        if (g_rows[i]->edit != edit && g_rows[i]->notesEdit != edit) continue;
+        if (notes) *notes = g_rows[i]->notesEdit == edit;
+        return i;
+    }
     return (size_t)-1;
 }
 
@@ -638,23 +661,33 @@ static HWND MakeStatic(DWORD style)
 
 static LRESULT CALLBACK EditProc(HWND, UINT, WPARAM, LPARAM);
 
-static Row* AddRow(const std::wstring& addr)
+// An address or notes box: Enter, Tab and Escape handled by EditProc.
+static HWND MakeEdit(const std::wstring& text)
+{
+    HWND h = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", text.c_str(),
+                             WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_LEFT,
+                             0, 0, 10, 10, g_hwnd, NULL, GetModuleHandle(NULL), NULL);
+    SendMessage(h, WM_SETFONT, (WPARAM)g_font, FALSE);
+    WNDPROC old = (WNDPROC)SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)EditProc);
+    if (!g_oldEditProc) g_oldEditProc = old;
+    ThemeControl(h, L"DarkMode_CFD");
+    return h;
+}
+
+static Row* AddRow(const std::wstring& addr, const std::wstring& notes)
 {
     Row* r = new Row;
     r->id = g_nextRowId++;
     r->addr = addr;
+    r->notes = notes;
     r->ctx = NULL;
     HINSTANCE hi = GetModuleHandle(NULL);
 
-    r->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", addr.c_str(),
-                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_LEFT,
-                              0, 0, 10, 10, g_hwnd, NULL, hi, NULL);
-    SendMessage(r->edit, WM_SETFONT, (WPARAM)g_font, FALSE);
+    r->grip = CreateWindowExW(0, L"MultiPingGrip", NULL, WS_CHILD | WS_VISIBLE,
+                              0, 0, 10, 10, g_hwnd, NULL, hi, r);
+    r->edit = MakeEdit(addr);
     SendMessage(r->edit, EM_SETCUEBANNER, FALSE, (LPARAM)Widen(kCue).c_str());
-    WNDPROC old = (WNDPROC)SetWindowLongPtrW(r->edit, GWLP_WNDPROC, (LONG_PTR)EditProc);
-    if (!g_oldEditProc) g_oldEditProc = old;
-    ThemeControl(r->edit, L"DarkMode_CFD");
-
+    r->notesEdit = MakeEdit(notes);
     r->cur = MakeStatic(SS_RIGHT);
     r->mn  = MakeStatic(SS_RIGHT);
     r->med = MakeStatic(SS_RIGHT);
@@ -674,7 +707,8 @@ static Row* AddRow(const std::wstring& addr)
 static void DeleteRow(Row* r)
 {
     StopPing(r);
-    HWND ctl[NCOL] = { r->edit, r->cur, r->mn, r->med, r->avg, r->mx, r->graph, r->del };
+    HWND ctl[NCOL];
+    RowWindows(r, ctl);
     for (HWND h : ctl) DestroyWindow(h);
     g_rows.erase(std::find(g_rows.begin(), g_rows.end(), r));
     delete r;
@@ -684,7 +718,7 @@ static void DeleteRow(Row* r)
 static void EnsureTrailingEmptyRow()
 {
     if (g_rows.empty() || !g_rows.back()->addr.empty()) {
-        AddRow(L"");
+        AddRow(L"", L"");
         UpdateScroll();
         Layout();
     }
@@ -707,12 +741,26 @@ static bool ApplyEdit(Row* r)
     return true;
 }
 
-static void FocusEdit(size_t i)
+// Reads the notes box into the row, and saves when they changed. Returns true if they did.
+static bool ApplyNotes(Row* r)
+{
+    wchar_t buf[512];
+    GetWindowTextW(r->notesEdit, buf, 512);
+    std::wstring n = Widen(OneLine(Narrow(buf)));
+    if (n == r->notes) return false;
+    r->notes = n;
+    SaveAddresses();
+    return true;
+}
+
+// Puts the caret in row i's address box, or its notes box, with the text selected.
+static void FocusEdit(size_t i, bool notes = false)
 {
     if (i >= g_rows.size()) return;
     EnsureRowVisible(i);
-    SetFocus(g_rows[i]->edit);
-    SendMessage(g_rows[i]->edit, EM_SETSEL, 0, -1);
+    HWND h = notes ? g_rows[i]->notesEdit : g_rows[i]->edit;
+    SetFocus(h);
+    SendMessage(h, EM_SETSEL, 0, -1);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -726,8 +774,9 @@ static LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w == VK_RETURN) { SendMessage(g_hwnd, WM_APP_ENTER, 0, (LPARAM)h); return 0; }
         if (w == VK_TAB)    { SendMessage(g_hwnd, WM_APP_TAB, GetKeyState(VK_SHIFT) < 0, (LPARAM)h); return 0; }
         if (w == VK_ESCAPE) {
-            size_t i = IndexOfEdit(h);
-            if (i != (size_t)-1) SetWindowTextW(h, g_rows[i]->addr.c_str());
+            bool notes = false;
+            size_t i = IndexOfEdit(h, &notes);
+            if (i != (size_t)-1) SetWindowTextW(h, (notes ? g_rows[i]->notes : g_rows[i]->addr).c_str());
             return 0;
         }
         break;
@@ -930,6 +979,124 @@ static LRESULT CALLBACK DeleteProc(HWND h, UINT m, WPARAM w, LPARAM l)
 }
 
 // ---------------------------------------------------------------------------------------------
+// Handle control: six dots at a row's left; dragged up or down, it moves the row
+// ---------------------------------------------------------------------------------------------
+
+// Moves the row being dragged to where the pointer is, scrolling the list a row when `scroll` is
+// set (the timer's tick), and keeps the timer running while the pointer is above or below the
+// rows shown.
+static void DragTo(bool scroll)
+{
+    if (!g_dragRow) return;
+    int n = (int)g_rows.size(), fit = RowsThatFit(), first = g_firstRow;
+    size_t from = std::find(g_rows.begin(), g_rows.end(), g_dragRow) - g_rows.begin();
+    int to = DragTarget(Mx(), g_dragY, &first, fit, n, n - 1, scroll);
+    bool moved = to != (int)from, scrolled = first != g_firstRow;
+    if (moved) { MoveItem(g_rows, from, (size_t)to); g_dragMoved = true; }
+    if (scrolled) { g_firstRow = first; UpdateScroll(); }
+    if (moved || scrolled) Layout();
+    if (DragOutside(Mx(), g_dragY, fit)) SetTimer(g_hwnd, TIMER_DRAG, DRAG_SCROLL_MS, NULL);
+    else KillTimer(g_hwnd, TIMER_DRAG);
+}
+
+static void EndDrag()
+{
+    if (!g_dragRow) return;
+    g_dragRow = NULL;
+    KillTimer(g_hwnd, TIMER_DRAG);
+    for (Row* r : g_rows) InvalidateRect(r->grip, NULL, FALSE);
+    if (g_dragMoved) SaveAddresses();
+}
+
+struct GripState { Row* row; bool tracking; };
+
+// A mouse message's pointer height, from the handle's client area to the main window's.
+static int MainY(HWND grip, LPARAM l)
+{
+    POINT pt = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+    MapWindowPoints(grip, g_hwnd, &pt, 1);
+    return pt.y;
+}
+
+static void PaintGrip(HWND h, GripState* st)
+{
+    PAINTSTRUCT ps;
+    HDC hdc = BeginPaint(h, &ps);
+    RECT rc; GetClientRect(h, &rc);
+    FillRect(hdc, &rc, FaceBrush());
+    POINT pt; GetCursorPos(&pt);
+    ScreenToClient(h, &pt);
+    bool active = g_dragRow ? g_dragRow == st->row : PtInRect(&rc, pt) != FALSE;
+    HBRUSH dots = CreateSolidBrush(Colour(active ? Pal().gripActive : Pal().grip));
+    Rect box = { 0, 0, rc.right, rc.bottom };
+    GripDots g = LayoutGrip(Mx(), box);
+    for (const Rect& d : g.dot) {
+        RECT dr = { d.x, d.y, d.x + d.w, d.y + d.h };
+        FillRect(hdc, &dr, dots);
+    }
+    DeleteObject(dots);
+    EndPaint(h, &ps);
+}
+
+static LRESULT CALLBACK GripProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    GripState* st = (GripState*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    switch (m) {
+    case WM_NCCREATE: {
+        st = new GripState;
+        st->row = (Row*)((CREATESTRUCT*)l)->lpCreateParams;
+        st->tracking = false;
+        SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)st);
+        return TRUE;
+    }
+    case WM_NCDESTROY:
+        delete st;
+        SetWindowLongPtrW(h, GWLP_USERDATA, 0);
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        if (st) PaintGrip(h, st);
+        else { PAINTSTRUCT ps; BeginPaint(h, &ps); EndPaint(h, &ps); }
+        return 0;
+    case WM_MOUSEMOVE:
+        if (st && !st->tracking) {
+            st->tracking = true;
+            TRACKMOUSEEVENT tme = { sizeof tme, TME_LEAVE, h, 0 };
+            TrackMouseEvent(&tme);
+            InvalidateRect(h, NULL, FALSE);
+        }
+        if (g_dragRow) { g_dragY = MainY(h, l); DragTo(false); }
+        return 0;
+    case WM_MOUSELEAVE:
+        if (st) { st->tracking = false; InvalidateRect(h, NULL, FALSE); }
+        return 0;
+    case WM_LBUTTONDOWN:
+        if (st && !g_closing) {
+            g_dragRow = st->row;
+            g_dragMoved = false;
+            g_dragY = MainY(h, l);
+            SetCapture(h);
+            InvalidateRect(h, NULL, FALSE);
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        // The release can bring the pointer's last move with it.
+        if (g_dragRow) { g_dragY = MainY(h, l); DragTo(false); }
+        if (GetCapture() == h) ReleaseCapture();   // ends the drag through WM_CAPTURECHANGED
+        EndDrag();
+        return 0;
+    case WM_CAPTURECHANGED:
+        EndDrag();
+        return 0;
+    case WM_SETCURSOR:
+        SetCursor(LoadCursor(NULL, IDC_SIZENS));
+        return TRUE;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Main window
 // ---------------------------------------------------------------------------------------------
 
@@ -1059,7 +1226,7 @@ static void CreateFonts()
 static void ApplyFonts()
 {
     for (Row* r : g_rows) {
-        HWND ctl[6] = { r->edit, r->cur, r->mn, r->med, r->avg, r->mx };
+        HWND ctl[7] = { r->edit, r->notesEdit, r->cur, r->mn, r->med, r->avg, r->mx };
         for (HWND h : ctl) SendMessage(h, WM_SETFONT, (WPARAM)g_font, TRUE);
     }
 }
@@ -1152,9 +1319,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (g_pGetDpiForWindow) g_dpi = g_pGetDpiForWindow(h);
         ApplyTheme();
         CreateFonts();
-        std::vector<std::wstring> addrs;
-        LoadAddresses(addrs);
-        for (const std::wstring& a : addrs) AddRow(a);
+        for (const Entry& e : LoadEntries()) AddRow(Widen(e.addr), Widen(e.notes));
         EnsureTrailingEmptyRow();
         SetTimer(h, TIMER_TICK, PING_INTERVAL_MS, NULL);
         return 0;
@@ -1208,6 +1373,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
 
     case WM_TIMER: {
+        if (w == TIMER_DRAG) { DragTo(true); return 0; }
         // One tick for every row: take last round's result, then release the next ping. All graphs
         // and labels therefore change in the same instant.
         if (g_closing || w != TIMER_TICK) return 0;
@@ -1230,25 +1396,34 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
     case WM_APP_APPLY: {
         if (g_closing) return 0;
-        size_t i = IndexOfEdit((HWND)l);
-        if (i != (size_t)-1 && ApplyEdit(g_rows[i])) EnsureTrailingEmptyRow();
+        bool notes = false;
+        size_t i = IndexOfEdit((HWND)l, &notes);
+        if (i == (size_t)-1) return 0;
+        if (notes) ApplyNotes(g_rows[i]);
+        else if (ApplyEdit(g_rows[i])) EnsureTrailingEmptyRow();
         return 0;
     }
     case WM_APP_ENTER: {
+        // From either box, on to the next row's address.
         if (g_closing) return 0;
-        size_t i = IndexOfEdit((HWND)l);
+        bool notes = false;
+        size_t i = IndexOfEdit((HWND)l, &notes);
         if (i == (size_t)-1) return 0;
-        ApplyEdit(g_rows[i]);
+        if (notes) ApplyNotes(g_rows[i]);
+        else ApplyEdit(g_rows[i]);
         EnsureTrailingEmptyRow();           // a filled-in last row gets a fresh empty row after it
         if (i + 1 < g_rows.size()) FocusEdit(i + 1);
         return 0;
     }
     case WM_APP_TAB: {
+        // The boxes in reading order: each row's address, then its notes.
         if (g_closing) return 0;
-        size_t i = IndexOfEdit((HWND)l);
+        bool notes = false;
+        size_t i = IndexOfEdit((HWND)l, &notes);
         if (i == (size_t)-1 || g_rows.empty()) return 0;
-        size_t n = g_rows.size();
-        FocusEdit(w ? (i + n - 1) % n : (i + 1) % n);
+        size_t n = 2 * g_rows.size(), f = 2 * i + (notes ? 1 : 0);
+        f = w ? (f + n - 1) % n : (f + 1) % n;
+        FocusEdit(f / 2, f % 2 == 1);
         return 0;
     }
     case WM_APP_DELETE: {
@@ -1278,6 +1453,14 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_DESTROY:
         g_closing = true;
         KillTimer(h, TIMER_TICK);
+        KillTimer(h, TIMER_DRAG);
+        for (Row* r : g_rows) {   // what the boxes hold, edited or not
+            wchar_t buf[512];
+            GetWindowTextW(r->edit, buf, 512);
+            r->addr = Widen(Trim(Narrow(buf)));
+            GetWindowTextW(r->notesEdit, buf, 512);
+            r->notes = Widen(OneLine(Narrow(buf)));
+        }
         SaveWindowRect(h);
         SaveAddresses();
         for (Row* r : g_rows) StopPing(r);
@@ -1332,6 +1515,10 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int nShow)
 
     wc.lpfnWndProc = DeleteProc;
     wc.lpszClassName = L"MultiPingDelete";
+    RegisterClassExW(&wc);
+
+    wc.lpfnWndProc = GripProc;
+    wc.lpszClassName = L"MultiPingGrip";
     RegisterClassExW(&wc);
 
     wc.style = CS_HREDRAW;

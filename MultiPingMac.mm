@@ -94,8 +94,9 @@ static NSImage* CroppedEmoji()
 
 struct Row {
     int id;
-    std::string addr;
-    NSTextField* field;
+    std::string addr, notes;
+    NSTextField* field;        // the address box, tagged with the row's id
+    NSTextField* notesField;   // the notes box, tagged with minus the row's id
     std::unique_ptr<Pinger> pinger;
     Stats stats;
 };
@@ -107,6 +108,7 @@ struct Row {
 @interface MPView : NSView <NSTextFieldDelegate>
 - (void)updateScroll;
 - (void)focusFirst;
+- (void)takeBoxes;
 - (void)save;
 - (void)stop;
 @end
@@ -117,6 +119,11 @@ struct Row {
     int _first;       // index of the first visible row (row-based scrolling)
     int _hover;       // the row whose delete button the pointer is over
     int _down;        // the row whose delete button is pressed
+    int _gripHover;   // the row whose handle the pointer is over
+    Row* _dragRow;    // the row being moved by its handle
+    BOOL _dragMoved;  // and whether it has left its place
+    int _dragY;       // the pointer's height while it is
+    NSTimer* _dragTimer;   // scrolls the list while the pointer is above or below the rows shown
     double _wheel;
     BOOL _closing;
     NSScroller* _bar;
@@ -128,7 +135,7 @@ struct Row {
 {
     if (!(self = [super initWithFrame:frame])) return nil;
     _nextId = 1;
-    _hover = _down = -1;
+    _hover = _down = _gripHover = -1;
     _emoji = CroppedEmoji();
     _bar = [[NSScroller alloc] initWithFrame:NSMakeRect(0, 0, [self barWidth], 100)];
     _bar.scrollerStyle = NSScrollerStyleLegacy;   // always there, as on Windows, not an overlay
@@ -137,7 +144,7 @@ struct Row {
     _bar.action = @selector(scrolled:);
     _bar.hidden = YES;
     [self addSubview:_bar];
-    for (const std::string& a : LoadAddresses()) [self addRow:a];
+    for (const Entry& e : LoadEntries()) [self addRow:e.addr notes:e.notes];
     [self ensureTrailingEmptyRow];
     _tick = [NSTimer timerWithTimeInterval:PING_INTERVAL_MS / 1000.0 target:self selector:@selector(tick:) userInfo:nil repeats:YES];
     _tick.tolerance = 0.005;
@@ -157,45 +164,75 @@ struct Row {
     for (auto& r : _rows) if (r->id == rid) return r.get();
     return NULL;
 }
-- (size_t)indexOfField:(NSControl*)field
+// The row an address or notes box belongs to, and which of the two it is.
+- (size_t)indexOfField:(NSControl*)field notes:(BOOL*)notes
 {
-    for (size_t i = 0; i < _rows.size(); i++) if (_rows[i]->field == field) return i;
+    for (size_t i = 0; i < _rows.size(); i++) {
+        if (_rows[i]->field != field && _rows[i]->notesField != field) continue;
+        if (notes) *notes = _rows[i]->notesField == field;
+        return i;
+    }
     return (size_t)-1;
+}
+
+// Takes what the boxes hold, edited or not, as the rows' addresses and notes: for quitting.
+- (void)takeBoxes
+{
+    for (auto& r : _rows) {
+        NSTextField* fields[2] = { r->field, r->notesField };
+        std::string text[2];
+        for (int k = 0; k < 2; k++) {
+            NSText* editor = [fields[k] currentEditor];
+            NSString* s = editor ? editor.string : fields[k].stringValue;
+            text[k] = s.UTF8String ? s.UTF8String : "";
+        }
+        r->addr = Trim(text[0]);
+        r->notes = OneLine(text[1]);
+    }
 }
 
 - (void)save
 {
-    std::vector<std::string> addrs;
-    for (auto& r : _rows) addrs.push_back(r->addr);
-    SaveAddresses(addrs);
+    std::vector<Entry> entries;
+    for (auto& r : _rows) entries.push_back(Entry{ r->addr, r->notes });
+    SaveEntries(entries);
 }
 
 - (void)stop
 {
     _closing = YES;
     [_tick invalidate];
+    [_dragTimer invalidate];
     _rows.clear();   // the pingers stop
 }
 
-- (Row*)addRow:(const std::string&)addr
+// An address or notes box: Enter, Tab and Escape handled by the delegate methods below.
+- (NSTextField*)makeField:(const std::string&)text tag:(int)tag
 {
-    std::unique_ptr<Row> r(new Row);
-    r->id = _nextId++;
-    r->addr = addr;
     NSTextField* f = [[NSTextField alloc] initWithFrame:NSZeroRect];
-    f.stringValue = NS(addr);
-    f.placeholderString = NS(kCue);
+    f.stringValue = NS(text);
     f.font = UiFont(FONT_PT);
     f.bezeled = YES;
     f.bezelStyle = NSTextFieldSquareBezel;
     f.editable = YES;
     f.usesSingleLineMode = YES;
     f.cell.scrollable = YES;
-    f.tag = r->id;
+    f.tag = tag;
     f.delegate = self;
     f.hidden = YES;
     [self addSubview:f];
-    r->field = f;
+    return f;
+}
+
+- (Row*)addRow:(const std::string&)addr notes:(const std::string&)notes
+{
+    std::unique_ptr<Row> r(new Row);
+    r->id = _nextId++;
+    r->addr = addr;
+    r->notes = notes;
+    r->field = [self makeField:addr tag:r->id];
+    r->field.placeholderString = NS(kCue);
+    r->notesField = [self makeField:notes tag:-r->id];
     if (!addr.empty()) r->pinger.reset(new Pinger(addr));
     _rows.push_back(std::move(r));
     return _rows.back().get();
@@ -205,7 +242,7 @@ struct Row {
 - (void)ensureTrailingEmptyRow
 {
     if (_rows.empty() || !_rows.back()->addr.empty()) {
-        [self addRow:""];
+        [self addRow:"" notes:""];
         [self updateScroll];
     }
 }
@@ -225,30 +262,47 @@ struct Row {
     return YES;
 }
 
+// Reads the notes box into the row, and saves when they changed. YES if they did.
+- (BOOL)applyNotes:(Row*)r
+{
+    NSText* editor = [r->notesField currentEditor];
+    NSString* text = editor ? editor.string : r->notesField.stringValue;
+    std::string n = OneLine(text.UTF8String ? text.UTF8String : "");
+    if (n == r->notes) return NO;
+    r->notes = n;
+    [self save];
+    return YES;
+}
+
 - (void)deleteRow:(int)rid
 {
-    if (_closing) return;
+    if (_closing || _dragRow) return;
     size_t i = 0;
     while (i < _rows.size() && _rows[i]->id != rid) i++;
     if (i == _rows.size()) return;
-    NSTextField* f = _rows[i]->field;
-    f.delegate = nil;            // its end of editing is no edit to apply
-    [f abortEditing];
-    [f removeFromSuperview];
+    for (NSTextField* f in @[ _rows[i]->field, _rows[i]->notesField ]) {
+        f.delegate = nil;            // its end of editing is no edit to apply
+        [f abortEditing];
+        [f removeFromSuperview];
+    }
     _rows.erase(_rows.begin() + (long)i);
-    _hover = -1;
+    _hover = _gripHover = -1;
     [self ensureTrailingEmptyRow];
     [self save];
     [self updateScroll];
     [self focusEdit:i < _rows.size() ? i : _rows.size() - 1];
 }
 
-- (void)focusEdit:(size_t)i
+- (void)focusEdit:(size_t)i { [self focusEdit:i notes:NO]; }
+
+// Puts the caret in row i's address box, or its notes box, with the text selected.
+- (void)focusEdit:(size_t)i notes:(BOOL)notes
 {
     if (i >= _rows.size()) return;
     [self ensureRowVisible:(int)i];
-    [self.window makeFirstResponder:_rows[i]->field];
-    [[_rows[i]->field currentEditor] selectAll:nil];
+    NSTextField* f = notes ? _rows[i]->notesField : _rows[i]->field;
+    [self.window makeFirstResponder:f];
+    [[f currentEditor] selectAll:nil];
 }
 
 // At the start, as on Windows: the caret at the start of the first address, nothing selected.
@@ -271,30 +325,37 @@ struct Row {
     self.needsDisplay = YES;
 }
 
-// --- the address boxes: Enter, Tab, Shift+Tab and Escape, and applying when editing ends ------
+// --- the address and notes boxes: Enter, Tab, Shift+Tab and Escape, and applying when editing
+// ends --------------------------------------------------------------------------------------------
 
 - (BOOL)control:(NSControl*)control textView:(NSTextView*)tv doCommandBySelector:(SEL)sel
 {
-    size_t i = [self indexOfField:control];
+    BOOL notes = NO;
+    size_t i = [self indexOfField:control notes:&notes];
     if (i == (size_t)-1 || _closing) return NO;
+    size_t n = 2 * _rows.size(), f = 2 * i + (notes ? 1 : 0);   // the boxes in reading order
     if (sel == @selector(insertNewline:)) {
-        [self applyEdit:_rows[i].get()];
+        // From either box, on to the next row's address.
+        if (notes) [self applyNotes:_rows[i].get()];
+        else [self applyEdit:_rows[i].get()];
         [self ensureTrailingEmptyRow];       // a filled-in last row gets a fresh empty row after it
         if (i + 1 < _rows.size()) [self focusEdit:i + 1];
         return YES;
     }
-    if (sel == @selector(insertTab:)) { [self focusEdit:(i + 1) % _rows.size()]; return YES; }
-    if (sel == @selector(insertBacktab:)) { [self focusEdit:(i + _rows.size() - 1) % _rows.size()]; return YES; }
-    if (sel == @selector(cancelOperation:)) { tv.string = NS(_rows[i]->addr); return YES; }
+    if (sel == @selector(insertTab:)) { f = (f + 1) % n; [self focusEdit:f / 2 notes:f % 2 == 1]; return YES; }
+    if (sel == @selector(insertBacktab:)) { f = (f + n - 1) % n; [self focusEdit:f / 2 notes:f % 2 == 1]; return YES; }
+    if (sel == @selector(cancelOperation:)) { tv.string = NS(notes ? _rows[i]->notes : _rows[i]->addr); return YES; }
     return NO;
 }
 
 - (void)controlTextDidEndEditing:(NSNotification*)n
 {
-    int rid = (int)((NSControl*)n.object).tag;
+    int tag = (int)((NSControl*)n.object).tag;
     dispatch_async(dispatch_get_main_queue(), ^{
-        Row* r = [self findRow:rid];
-        if (r && !self->_closing && [self applyEdit:r]) [self ensureTrailingEmptyRow];
+        Row* r = [self findRow:tag < 0 ? -tag : tag];
+        if (!r || self->_closing) return;
+        if (tag < 0) [self applyNotes:r];
+        else if ([self applyEdit:r]) [self ensureTrailingEmptyRow];
     });
 }
 
@@ -354,10 +415,12 @@ struct Row {
     Cols c = M.Columns([self clientWidth]);
     int fit = [self fit];
     for (size_t i = 0; i < _rows.size(); i++) {
-        NSTextField* f = _rows[i]->field;
         BOOL shown = (int)i >= _first && (int)i < _first + fit;
-        if (shown) f.frame = R(M.Cell(c, C_ADDR, M.RowTop((int)i - _first)));
-        if (shown == f.hidden) f.hidden = !shown;
+        NSTextField* fields[2] = { _rows[i]->field, _rows[i]->notesField };
+        for (int k = 0; k < 2; k++) {
+            if (shown) fields[k].frame = R(M.Cell(c, k ? C_NOTES : C_ADDR, M.RowTop((int)i - _first)));
+            if (shown == fields[k].hidden) fields[k].hidden = !shown;
+        }
     }
     [self.window invalidateCursorRectsForView:self];
     self.needsDisplay = YES;
@@ -385,23 +448,103 @@ struct Row {
     [super updateTrackingAreas];
 }
 
+// The visible row whose handle is at p, or -1. The empty row at the end has none.
+- (int)gripAt:(NSPoint)p
+{
+    Cols c = M.Columns([self clientWidth]);
+    for (int slot = 0; slot < [self fit] && _first + slot + 1 < (int)_rows.size(); slot++)
+        if (NSPointInRect(p, R(M.Cell(c, C_GRIP, M.RowTop(slot))))) return _first + slot;
+    return -1;
+}
+
 - (void)resetCursorRects
 {
     Cols c = M.Columns([self clientWidth]);
-    for (int slot = 0; slot < [self fit] && _first + slot < (int)_rows.size(); slot++)
+    for (int slot = 0; slot < [self fit] && _first + slot < (int)_rows.size(); slot++) {
         [self addCursorRect:R(M.Cell(c, C_DEL, M.RowTop(slot))) cursor:[NSCursor pointingHandCursor]];
+        if (_first + slot + 1 < (int)_rows.size())
+            [self addCursorRect:R(M.Cell(c, C_GRIP, M.RowTop(slot))) cursor:[NSCursor openHandCursor]];
+    }
 }
 
-- (void)setHover:(int)over { if (over != _hover) { _hover = over; self.needsDisplay = YES; } }
-- (void)mouseMoved:(NSEvent*)e { [self setHover:[self deleteAt:[self convertPoint:e.locationInWindow fromView:nil]]]; }
-- (void)mouseExited:(NSEvent*)e { [self setHover:-1]; }
+- (void)setHover:(int)over grip:(int)grip
+{
+    if (over == _hover && grip == _gripHover) return;
+    _hover = over;
+    _gripHover = grip;
+    self.needsDisplay = YES;
+}
+- (void)mouseMoved:(NSEvent*)e
+{
+    NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+    [self setHover:[self deleteAt:p] grip:[self gripAt:p]];
+}
+- (void)mouseExited:(NSEvent*)e { if (!_dragRow) [self setHover:-1 grip:-1]; }
+
+// Moves the row being dragged to where the pointer is, scrolling the list a row when `scroll` is
+// set (the timer's tick), and keeps the timer running while the pointer is above or below the
+// rows shown.
+- (void)dragTo:(BOOL)scroll
+{
+    if (!_dragRow) return;
+    int n = (int)_rows.size(), fit = [self fit], first = _first;
+    size_t from = 0;
+    while (_rows[from].get() != _dragRow) from++;
+    int to = DragTarget(M, _dragY, &first, fit, n, n - 1, scroll);
+    bool moved = to != (int)from, scrolled = first != _first;
+    if (moved) { MoveItem(_rows, from, (size_t)to); _dragMoved = YES; }
+    if (scrolled) _first = first;
+    if (moved || scrolled) [self updateScroll];
+    if (!DragOutside(M, _dragY, fit)) {
+        [_dragTimer invalidate];
+        _dragTimer = nil;
+    } else if (!_dragTimer) {
+        _dragTimer = [NSTimer timerWithTimeInterval:DRAG_SCROLL_MS / 1000.0 target:self selector:@selector(dragTick:) userInfo:nil repeats:YES];
+        [[NSRunLoop mainRunLoop] addTimer:_dragTimer forMode:NSRunLoopCommonModes];
+    }
+}
+- (void)dragTick:(NSTimer*)t { [self dragTo:YES]; }
+
 - (void)mouseDown:(NSEvent*)e
 {
-    _down = [self deleteAt:[self convertPoint:e.locationInWindow fromView:nil]];
+    NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+    int grip = [self gripAt:p];
+    if (grip >= 0) {
+        // A row's handle: the row follows the pointer up and down until the button goes up.
+        _dragRow = _rows[(size_t)grip].get();
+        _dragMoved = NO;
+        _dragY = (int)p.y;
+        [self.window disableCursorRects];
+        [[NSCursor closedHandCursor] set];
+        self.needsDisplay = YES;
+        return;
+    }
+    _down = [self deleteAt:p];
     if (_down >= 0) self.needsDisplay = YES;
+}
+- (void)mouseDragged:(NSEvent*)e
+{
+    if (!_dragRow) return;
+    _dragY = (int)[self convertPoint:e.locationInWindow fromView:nil].y;
+    [self dragTo:NO];
 }
 - (void)mouseUp:(NSEvent*)e
 {
+    if (_dragRow) {
+        _dragY = (int)[self convertPoint:e.locationInWindow fromView:nil].y;   // the release can bring the pointer's last move with it
+        [self dragTo:NO];
+        _dragRow = NULL;
+        [_dragTimer invalidate];
+        _dragTimer = nil;
+        [self.window enableCursorRects];
+        [self.window invalidateCursorRectsForView:self];
+        NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+        [([self gripAt:p] >= 0 ? [NSCursor openHandCursor] : [NSCursor arrowCursor]) set];
+        _hover = _gripHover = -2;   // so that setHover: draws again
+        [self setHover:[self deleteAt:p] grip:[self gripAt:p]];
+        if (_dragMoved) [self save];
+        return;
+    }
     if (_down < 0) return;
     int pressed = _down;
     _down = -1;
@@ -472,7 +615,7 @@ struct Row {
     [Colour(P.headerLine) setFill];
     NSRectFill(NSMakeRect(c.x[0], y + M.S(HDR_H), c.x[NCOL - 1] + c.w[NCOL - 1] - c.x[0], 1));
 
-    // The visible rows: labels, graph, delete button; the address boxes are views of their own.
+    // The visible rows: handle, labels, graph, delete button; the boxes are views of their own.
     int fit = [self fit];
     for (int slot = 0; slot < fit && _first + slot < (int)_rows.size(); slot++) {
         const Row& r = *_rows[(size_t)(_first + slot)];
@@ -483,6 +626,10 @@ struct Row {
         for (int k = C_CUR; k <= C_MAX; k++) DrawText(NS(labels[k - C_CUR]), font, text, M.Cell(c, k, top), true, true);
         [self paintGraph:M.Cell(c, C_GRAPH, top) stats:r.stats palette:P];
         int i = _first + slot;
+        if (i + 1 < (int)_rows.size()) {   // the empty row at the end has no handle: it stays last
+            bool active = _dragRow ? _dragRow == _rows[(size_t)i].get() : i == _gripHover;
+            [self paintGrip:M.Cell(c, C_GRIP, top) colour:active ? P.gripActive : P.grip];
+        }
         [self paintDelete:M.Cell(c, C_DEL, top) colour:i == _down ? P.delDown : i == _hover ? P.delHover : P.del];
     }
 }
@@ -523,6 +670,14 @@ struct Row {
     [Colour(P.graphBorder) setFill];
     NSFrameRect(R(box));
     [gc restoreGraphicsState];
+}
+
+// The handle's six dots.
+- (void)paintGrip:(const mp::Rect&)box colour:(const Rgb&)colour
+{
+    GripDots g = LayoutGrip(M, box);
+    [Colour(colour) setFill];
+    for (const mp::Rect& d : g.dot) NSRectFill(R(d));
 }
 
 // Red filled circle with a white X, antialiased.
@@ -625,6 +780,7 @@ static NSMenuItem* Item(NSString* title, SEL action, NSString* key)
     // AppKit counts), made to fit the screen it is on now; else centred, sized for eight rows.
     WindowRect r;
     if (LoadWindowRect(&r)) {
+        r.w = FitSavedWidth(r.w, (long)_window.contentMinSize.width, M.DefaultWidth());
         NSRect want = NSMakeRect(r.x, r.y, r.w, r.h);
         NSScreen* screen = NSScreen.mainScreen;
         for (NSScreen* s in NSScreen.screens)
@@ -660,6 +816,7 @@ static NSMenuItem* Item(NSString* title, SEL action, NSString* key)
     NSRect c = [_window contentRectForFrameRect:_window.frame];
     WindowRect r = { (long)c.origin.x, (long)c.origin.y, (long)c.size.width, (long)c.size.height };
     SaveWindowRect(r);
+    [_view takeBoxes];
     [_view save];
     [_view stop];
 }

@@ -115,16 +115,16 @@ inline void WriteWholeFile(const std::string& path, const std::string& bytes)
     else unlink(tmp.c_str());
 }
 
-inline std::vector<std::string> LoadAddresses()
+inline std::vector<Entry> LoadEntries()
 {
     std::string bytes;
     ReadWholeFile(ConfigDir(false) + "/addresses.txt", &bytes);
-    return ParseAddresses(bytes);
+    return ParseEntries(bytes);
 }
 
-inline void SaveAddresses(const std::vector<std::string>& addrs)
+inline void SaveEntries(const std::vector<Entry>& rows)
 {
-    WriteWholeFile(ConfigDir(true) + "/addresses.txt", JoinAddresses(addrs, "\n"));
+    WriteWholeFile(ConfigDir(true) + "/addresses.txt", JoinEntries(rows, "\n"));
 }
 
 // window.txt's rectangle is the window's content, in the toolkit's screen coordinates.

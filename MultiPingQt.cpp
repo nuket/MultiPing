@@ -120,8 +120,9 @@ static QImage CroppedEmoji(const QString& family)
 
 struct Row {
     int id;
-    std::string addr;
+    std::string addr, notes;
     QLineEdit* edit;
+    QLineEdit* notesEdit;
     std::unique_ptr<Pinger> pinger;
     Stats stats;
 };
@@ -146,8 +147,11 @@ public:
         QObject::connect(bar_, &QScrollBar::valueChanged, [this](int v) { SetFirstRow(v); });
         setMinimumSize(M.MinContentWidth() + bar_->sizeHint().width(), M.ContentHeightFor(MIN_ROWS));
 
-        for (const std::string& a : LoadAddresses()) AddRow(a);
+        for (const Entry& e : LoadEntries()) AddRow(e.addr, e.notes);
         EnsureTrailingEmptyRow();
+
+        dragTimer_.setInterval(DRAG_SCROLL_MS);
+        QObject::connect(&dragTimer_, &QTimer::timeout, [this] { DragTo(true); });
 
         tick_.setTimerType(Qt::PreciseTimer);
         tick_.setInterval(PING_INTERVAL_MS);
@@ -180,20 +184,45 @@ protected:
 
     void mouseMoveEvent(QMouseEvent* e) override
     {
-        int over = DeleteAt(e->pos());
-        if (over != hover_) { hover_ = over; update(); }
-        if (over >= 0) setCursor(Qt::PointingHandCursor); else unsetCursor();
+        if (dragRow_) { dragY_ = e->pos().y(); DragTo(false); return; }
+        int over = DeleteAt(e->pos()), grip = GripAt(e->pos());
+        if (over != hover_ || grip != gripHover_) { hover_ = over; gripHover_ = grip; update(); }
+        if (over >= 0) setCursor(Qt::PointingHandCursor);
+        else if (grip >= 0) setCursor(Qt::OpenHandCursor);
+        else unsetCursor();
     }
-    void leaveEvent(QEvent*) override { if (hover_ >= 0) { hover_ = -1; update(); } }
+    void leaveEvent(QEvent*) override
+    {
+        if (hover_ >= 0 || gripHover_ >= 0) { hover_ = gripHover_ = -1; update(); }
+    }
     void mousePressEvent(QMouseEvent* e) override
     {
         if (e->button() != Qt::LeftButton) return;
+        int grip = GripAt(e->pos());
+        if (grip >= 0) {
+            // A row's handle: the row follows the pointer up and down until the button goes up.
+            dragRow_ = rows_[(size_t)grip].get();
+            dragMoved_ = false;
+            dragY_ = e->pos().y();
+            setCursor(Qt::ClosedHandCursor);
+            update();
+            return;
+        }
         down_ = DeleteAt(e->pos());
         if (down_ >= 0) update();
     }
     void mouseReleaseEvent(QMouseEvent* e) override
     {
-        if (e->button() != Qt::LeftButton || down_ < 0) return;
+        if (e->button() != Qt::LeftButton) return;
+        if (dragRow_) {
+            dragY_ = e->pos().y();   // the release can bring the pointer's last move with it
+            DragTo(false);
+            EndDrag();
+            gripHover_ = GripAt(e->pos());
+            if (gripHover_ >= 0) setCursor(Qt::OpenHandCursor); else unsetCursor();
+            return;
+        }
+        if (down_ < 0) return;
         int pressed = down_;
         down_ = -1;
         update();
@@ -207,6 +236,10 @@ protected:
     {
         closing_ = true;
         tick_.stop();
+        for (auto& r : rows_) {   // what the boxes hold, edited or not
+            r->addr = Trim(r->edit->text().toUtf8().toStdString());
+            r->notes = OneLine(r->notesEdit->text().toUtf8().toStdString());
+        }
         QRect g = geometry();
         WindowRect r = { g.x(), g.y(), g.width(), g.height() };
         SaveWindowRect(r);
@@ -215,36 +248,44 @@ protected:
         e->accept();
     }
 
-    // The address boxes: Enter, Tab, Shift+Tab and Escape, and applying on focus loss.
+    // The address and notes boxes: Enter, Tab, Shift+Tab and Escape, and applying on focus loss.
     bool eventFilter(QObject* o, QEvent* e) override
     {
         QLineEdit* edit = qobject_cast<QLineEdit*>(o);
-        size_t i = IndexOf(edit);
+        bool notes = false;
+        size_t i = IndexOf(edit, &notes);
         if (!edit || i == (size_t)-1 || closing_) return QWidget::eventFilter(o, e);
         if (e->type() == QEvent::KeyPress) {
             QKeyEvent* k = static_cast<QKeyEvent*>(e);
+            size_t n = 2 * rows_.size(), f = 2 * i + (notes ? 1 : 0);   // the boxes in reading order
             switch (k->key()) {
             case Qt::Key_Return:
             case Qt::Key_Enter:
-                ApplyEdit(rows_[i].get());
+                // From either box, on to the next row's address.
+                if (notes) ApplyNotes(rows_[i].get());
+                else ApplyEdit(rows_[i].get());
                 EnsureTrailingEmptyRow();          // a filled-in last row gets a fresh empty row after it
                 if (i + 1 < rows_.size()) FocusEdit(i + 1);
                 return true;
             case Qt::Key_Tab:
-                FocusEdit((i + 1) % rows_.size());
+                f = (f + 1) % n;
+                FocusEdit(f / 2, f % 2 == 1);
                 return true;
             case Qt::Key_Backtab:
-                FocusEdit((i + rows_.size() - 1) % rows_.size());
+                f = (f + n - 1) % n;
+                FocusEdit(f / 2, f % 2 == 1);
                 return true;
             case Qt::Key_Escape:
-                edit->setText(Q(rows_[i]->addr));
+                edit->setText(Q(notes ? rows_[i]->notes : rows_[i]->addr));
                 return true;
             }
         } else if (e->type() == QEvent::FocusOut) {
             int id = rows_[i]->id;
-            QTimer::singleShot(0, this, [this, id] {
+            QTimer::singleShot(0, this, [this, id, notes] {
                 Row* r = FindRow(id);
-                if (r && !closing_ && ApplyEdit(r)) EnsureTrailingEmptyRow();
+                if (!r || closing_) return;
+                if (notes) ApplyNotes(r);
+                else if (ApplyEdit(r)) EnsureTrailingEmptyRow();
             });
         }
         return QWidget::eventFilter(o, e);
@@ -256,6 +297,11 @@ private:
     int first_ = 0;         // index of the first visible row (row-based scrolling)
     int hover_ = -1;        // the row whose delete button the pointer is over
     int down_ = -1;         // the row whose delete button is pressed
+    int gripHover_ = -1;    // the row whose handle the pointer is over
+    Row* dragRow_ = nullptr;   // the row being moved by its handle
+    bool dragMoved_ = false;   // and whether it has left its place
+    int dragY_ = 0;            // the pointer's height while it is
+    QTimer dragTimer_;         // scrolls the list while the pointer is above or below the rows shown
     double wheel_ = 0;
     bool closing_ = false;
     QScrollBar* bar_;
@@ -271,10 +317,52 @@ private:
         for (auto& r : rows_) if (r->id == id) return r.get();
         return nullptr;
     }
-    size_t IndexOf(QLineEdit* edit) const
+    // The row an address or notes box belongs to, and which of the two it is.
+    size_t IndexOf(QLineEdit* edit, bool* notes = nullptr) const
     {
-        for (size_t i = 0; i < rows_.size(); i++) if (rows_[i]->edit == edit) return i;
+        for (size_t i = 0; i < rows_.size(); i++) {
+            if (rows_[i]->edit != edit && rows_[i]->notesEdit != edit) continue;
+            if (notes) *notes = rows_[i]->notesEdit == edit;
+            return i;
+        }
         return (size_t)-1;
+    }
+
+    // The visible row whose handle is at `p`, or -1. The empty row at the end has none.
+    int GripAt(const QPoint& p) const
+    {
+        Cols c = M.Columns(ClientWidth());
+        for (int slot = 0; slot < Fit() && first_ + slot + 1 < (int)rows_.size(); slot++) {
+            Rect g = M.Cell(c, C_GRIP, M.RowTop(slot));
+            if (QRect(g.x, g.y, g.w, g.h).contains(p)) return first_ + slot;
+        }
+        return -1;
+    }
+
+    // Moves the row being dragged to where the pointer is, scrolling the list a row when `scroll`
+    // is set (the timer's tick), and keeps the timer running while the pointer is above or below
+    // the rows shown.
+    void DragTo(bool scroll)
+    {
+        if (!dragRow_) return;
+        int n = (int)rows_.size(), fit = Fit(), first = first_;
+        size_t from = 0;
+        while (rows_[from].get() != dragRow_) from++;
+        int to = DragTarget(M, dragY_, &first, fit, n, n - 1, scroll);
+        bool moved = to != (int)from, scrolled = first != first_;
+        if (moved) { MoveItem(rows_, from, (size_t)to); dragMoved_ = true; }
+        if (scrolled) { first_ = first; UpdateScroll(); }
+        if (moved || scrolled) Layout();
+        if (!DragOutside(M, dragY_, fit)) dragTimer_.stop();
+        else if (!dragTimer_.isActive()) dragTimer_.start();
+    }
+
+    void EndDrag()
+    {
+        dragRow_ = nullptr;
+        dragTimer_.stop();
+        update();
+        if (dragMoved_) Save();
     }
 
     // The visible row whose delete button is at `p`, or -1.
@@ -290,20 +378,29 @@ private:
 
     void Save()
     {
-        std::vector<std::string> addrs;
-        for (auto& r : rows_) addrs.push_back(r->addr);
-        SaveAddresses(addrs);
+        std::vector<Entry> entries;
+        for (auto& r : rows_) entries.push_back(Entry{ r->addr, r->notes });
+        SaveEntries(entries);
     }
 
-    Row* AddRow(const std::string& addr)
+    // An address or notes box: Enter, Tab and Escape handled by eventFilter.
+    QLineEdit* MakeEdit(const std::string& text)
+    {
+        QLineEdit* edit = new QLineEdit(Q(text), this);
+        edit->setFont(UiFont(FONT_PT));
+        edit->installEventFilter(this);
+        return edit;
+    }
+
+    Row* AddRow(const std::string& addr, const std::string& notes)
     {
         std::unique_ptr<Row> r(new Row);
         r->id = nextId_++;
         r->addr = addr;
-        r->edit = new QLineEdit(Q(addr), this);
-        r->edit->setFont(UiFont(FONT_PT));
+        r->notes = notes;
+        r->edit = MakeEdit(addr);
         r->edit->setPlaceholderText(kCue);
-        r->edit->installEventFilter(this);
+        r->notesEdit = MakeEdit(notes);
         if (!addr.empty()) r->pinger.reset(new Pinger(addr));
         rows_.push_back(std::move(r));
         return rows_.back().get();
@@ -313,7 +410,7 @@ private:
     void EnsureTrailingEmptyRow()
     {
         if (rows_.empty() || !rows_.back()->addr.empty()) {
-            AddRow("");
+            AddRow("", "");
             UpdateScroll();
             Layout();
         }
@@ -332,17 +429,27 @@ private:
         return true;
     }
 
+    // Reads the notes box into the row, and saves when they changed. True if they did.
+    bool ApplyNotes(Row* r)
+    {
+        std::string n = OneLine(r->notesEdit->text().toUtf8().toStdString());
+        if (n == r->notes) return false;
+        r->notes = n;
+        Save();
+        return true;
+    }
+
     void DeleteRow(int id)
     {
-        if (closing_) return;
+        if (closing_ || dragRow_) return;
         size_t i = 0;
         while (i < rows_.size() && rows_[i]->id != id) i++;
         if (i == rows_.size()) return;
-        QLineEdit* edit = rows_[i]->edit;
-        edit->removeEventFilter(this);     // its focus loss is no edit to apply
+        QLineEdit* edits[2] = { rows_[i]->edit, rows_[i]->notesEdit };
+        for (QLineEdit* edit : edits) edit->removeEventFilter(this);   // their focus loss is no edit to apply
         rows_.erase(rows_.begin() + (long)i);
-        delete edit;
-        hover_ = -1;
+        for (QLineEdit* edit : edits) delete edit;
+        hover_ = gripHover_ = -1;
         EnsureTrailingEmptyRow();
         Save();
         UpdateScroll();
@@ -350,12 +457,14 @@ private:
         FocusEdit(i < rows_.size() ? i : rows_.size() - 1);
     }
 
-    void FocusEdit(size_t i)
+    // Puts the caret in row i's address box, or its notes box, with the text selected.
+    void FocusEdit(size_t i, bool notes = false)
     {
         if (i >= rows_.size()) return;
         EnsureRowVisible((int)i);
-        rows_[i]->edit->setFocus();
-        rows_[i]->edit->selectAll();
+        QLineEdit* edit = notes ? rows_[i]->notesEdit : rows_[i]->edit;
+        edit->setFocus();
+        edit->selectAll();
     }
 
     // One tick for every row: take last round's result, then release the next ping. All graphs
@@ -407,13 +516,15 @@ private:
         Cols c = M.Columns(ClientWidth());
         int fit = Fit();
         for (size_t i = 0; i < rows_.size(); i++) {
-            QLineEdit* edit = rows_[i]->edit;
             bool shown = (int)i >= first_ && (int)i < first_ + fit;
-            if (shown) {
-                Rect r = M.Cell(c, C_ADDR, M.RowTop((int)i - first_));
-                edit->setGeometry(r.x, r.y, r.w, r.h);
+            QLineEdit* edits[2] = { rows_[i]->edit, rows_[i]->notesEdit };
+            for (int k = 0; k < 2; k++) {
+                if (shown) {
+                    Rect r = M.Cell(c, k ? C_NOTES : C_ADDR, M.RowTop((int)i - first_));
+                    edits[k]->setGeometry(r.x, r.y, r.w, r.h);
+                }
+                if (shown == edits[k]->isHidden()) edits[k]->setVisible(shown);
             }
-            if (shown == edit->isHidden()) edit->setVisible(shown);
         }
         update();
     }
@@ -423,6 +534,7 @@ private:
 
     void PaintGraph(QPainter& p, const Rect& box, const Stats& s, const Palette& P);
     void PaintDelete(QPainter& p, const Rect& box, const Rgb& colour);
+    void PaintGrip(QPainter& p, const Rect& box, const Rgb& colour);
 };
 
 void Window::paintEvent(QPaintEvent*)
@@ -483,7 +595,7 @@ void Window::paintEvent(QPaintEvent*)
     int ly = y + M.S(HDR_H);
     p.drawLine(c.x[0], ly, c.x[NCOL - 1] + c.w[NCOL - 1] - 1, ly);
 
-    // The visible rows: labels, graph, delete button; the address boxes are widgets of their own.
+    // The visible rows: handle, labels, graph, delete button; the boxes are widgets of their own.
     int fit = Fit();
     for (int slot = 0; slot < fit && first_ + slot < (int)rows_.size(); slot++) {
         const Row& r = *rows_[(size_t)(first_ + slot)];
@@ -499,6 +611,10 @@ void Window::paintEvent(QPaintEvent*)
         }
         PaintGraph(p, M.Cell(c, C_GRAPH, top), r.stats, P);
         int i = first_ + slot;
+        if (i + 1 < (int)rows_.size()) {   // the empty row at the end has no handle: it stays last
+            bool active = dragRow_ ? dragRow_ == rows_[(size_t)i].get() : i == gripHover_;
+            PaintGrip(p, M.Cell(c, C_GRIP, top), active ? P.gripActive : P.grip);
+        }
         PaintDelete(p, M.Cell(c, C_DEL, top), i == down_ ? P.delDown : i == hover_ ? P.delHover : P.del);
     }
 }
@@ -541,6 +657,13 @@ void Window::PaintGraph(QPainter& p, const Rect& box, const Stats& s, const Pale
     p.restore();
 }
 
+// The handle's six dots.
+void Window::PaintGrip(QPainter& p, const Rect& box, const Rgb& colour)
+{
+    GripDots g = LayoutGrip(M, box);
+    for (const Rect& d : g.dot) p.fillRect(d.x, d.y, d.w, d.h, Colour(colour));
+}
+
 // Red filled circle with a white X, antialiased.
 void Window::PaintDelete(QPainter& p, const Rect& box, const Rgb& colour)
 {
@@ -572,6 +695,7 @@ int main(int argc, char** argv)
     // itself (Wayland), only the size.
     WindowRect r;
     if (LoadWindowRect(&r)) {
+        r.w = FitSavedWidth(r.w, w.minimumWidth(), w.sizeHint().width());
         QScreen* screen = QGuiApplication::screenAt(QPoint((int)(r.x + r.w / 2), (int)(r.y + r.h / 2)));
         if (!screen) screen = QGuiApplication::primaryScreen();
         QRect wa = screen->availableGeometry();
