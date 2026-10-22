@@ -10,7 +10,7 @@ with the same look everywhere and no extra dependencies.
 
 <p align="center">
   <img src="screenshots/carousel.webp" width="100%"
-       alt="MultiPing on Windows XP, 10 and 11, macOS, Ubuntu with GTK 3, and Kubuntu 24.04 and 26.04 with Qt 5 and Qt 6, in light and dark mode">
+       alt="MultiPing on Windows XP, 7, 10 and 11, macOS, Ubuntu with GTK 3, and Kubuntu 24.04 and 26.04 with Qt 5 and Qt 6, in light and dark mode">
 </p>
 
 ## Which program?
