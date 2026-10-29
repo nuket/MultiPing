@@ -319,7 +319,7 @@ struct Row {
 {
     if (_closing) return;
     for (auto& r : _rows) {
-        int res;
+        int res = RES_NONE;
         if (r->pinger && r->pinger->Tick(&res)) r->stats.Record(res);
     }
     self.needsDisplay = YES;
@@ -615,7 +615,7 @@ struct Row {
     [Colour(P.headerLine) setFill];
     NSRectFill(NSMakeRect(c.x[0], y + M.S(HDR_H), c.x[NCOL - 1] + c.w[NCOL - 1] - c.x[0], 1));
 
-    // The visible rows: handle, labels, graph, delete button; the boxes are views of their own.
+    // The visible rows: handle, labels, charts, delete button; the boxes are views of their own.
     int fit = [self fit];
     for (int slot = 0; slot < fit && _first + slot < (int)_rows.size(); slot++) {
         const Row& r = *_rows[(size_t)(_first + slot)];
@@ -624,7 +624,7 @@ struct Row {
         labels[0] = r.stats.Current();
         r.stats.Summary(labels + 1);
         for (int k = C_CUR; k <= C_MAX; k++) DrawText(NS(labels[k - C_CUR]), font, text, M.Cell(c, k, top), true, true);
-        [self paintGraph:M.Cell(c, C_GRAPH, top) stats:r.stats palette:P];
+        for (int k = C_GRAPH; k <= C_HIST; k++) [self paintGraph:M.Cell(c, k, top) col:k stats:r.stats palette:P];
         int i = _first + slot;
         if (i + 1 < (int)_rows.size()) {   // the empty row at the end has no handle: it stays last
             bool active = _dragRow ? _dragRow == _rows[(size_t)i].get() : i == _gripHover;
@@ -634,19 +634,20 @@ struct Row {
     }
 }
 
-- (void)paintGraph:(const mp::Rect&)box stats:(const Stats&)s palette:(const Palette&)P
+// The chart in column col (C_GRAPH or C_HIST) of a row's statistics.
+- (void)paintGraph:(const mp::Rect&)box col:(int)col stats:(const Stats&)s palette:(const Palette&)P
 {
     NSGraphicsContext* gc = [NSGraphicsContext currentContext];
     [gc saveGraphicsState];
     gc.shouldAntialias = NO;
     [Colour(P.graphBack) setFill];
     NSRectFill(R(box));
-    Graph g = LayoutGraph(s, box.w, box.h);
+    Graph g = LayoutChart(s, col, box.w, box.h);
     int bottom = g.plot.y + g.plot.h;
 
     // Grid lines at 25 / 50 / 75 %.
     [Colour(P.graphGrid) setFill];
-    for (int gy : g.gridY) NSRectFill(NSMakeRect(box.x + g.plot.x, box.y + gy, g.plot.w, 1));
+    for (const mp::Rect& l : g.grid) NSRectFill(NSMakeRect(box.x + l.x, box.y + l.y, l.w, l.h));
 
     for (const GraphBar& b : g.bars) {
         [Colour(b.timeout ? P.graphTimeout : P.graphBar) setFill];
@@ -657,11 +658,13 @@ struct Row {
         }
     }
 
-    // Scale label, top-left, on a backing of the graph's own colour that keeps it legible over tall bars.
+    // Scale label, in the graph's top left corner and the histogram's top right, on a backing of
+    // the chart's own colour that keeps it legible over tall bars.
     NSFont* small = UiFont(FONT_SMALL_PT);
     NSString* label = NS(g.scaleLabel);
     NSSize ls = [label sizeWithAttributes:@{ NSFontAttributeName: small }];
-    mp::Rect lr = { box.x + g.plot.x + M.S(3), box.y + g.plot.y + M.S(1), (int)ceil(ls.width), (int)ceil(ls.height) };
+    int lw = (int)ceil(ls.width);
+    mp::Rect lr = { box.x + (g.labelRight ? g.plot.x + g.plot.w - M.S(3) - lw : g.plot.x + M.S(3)), box.y + g.plot.y + M.S(1), lw, (int)ceil(ls.height) };
     [Colour(P.graphBack) setFill];
     NSRectFill(R(lr));
     gc.shouldAntialias = YES;

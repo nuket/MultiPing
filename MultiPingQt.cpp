@@ -472,7 +472,7 @@ private:
     void Tick()
     {
         for (auto& r : rows_) {
-            int res;
+            int res = RES_NONE;
             if (r->pinger && r->pinger->Tick(&res)) r->stats.Record(res);
         }
         update();
@@ -532,7 +532,7 @@ private:
     // The palette for the theme's: a dark window, a dark theme. Qt repaints when the theme changes.
     const Palette& Colours() const { return PaletteFor(palette().window().color().lightness() < 128); }
 
-    void PaintGraph(QPainter& p, const Rect& box, const Stats& s, const Palette& P);
+    void PaintGraph(QPainter& p, const Rect& box, int col, const Stats& s, const Palette& P);
     void PaintDelete(QPainter& p, const Rect& box, const Rgb& colour);
     void PaintGrip(QPainter& p, const Rect& box, const Rgb& colour);
 };
@@ -595,7 +595,7 @@ void Window::paintEvent(QPaintEvent*)
     int ly = y + M.S(HDR_H);
     p.drawLine(c.x[0], ly, c.x[NCOL - 1] + c.w[NCOL - 1] - 1, ly);
 
-    // The visible rows: handle, labels, graph, delete button; the boxes are widgets of their own.
+    // The visible rows: handle, labels, charts, delete button; the boxes are widgets of their own.
     int fit = Fit();
     for (int slot = 0; slot < fit && first_ + slot < (int)rows_.size(); slot++) {
         const Row& r = *rows_[(size_t)(first_ + slot)];
@@ -609,7 +609,7 @@ void Window::paintEvent(QPaintEvent*)
             Rect cell = M.Cell(c, k, top);
             p.drawText(QRect(cell.x, cell.y, cell.w, cell.h), Qt::AlignRight | Qt::AlignVCenter | Qt::TextSingleLine, Q(labels[k - C_CUR]));
         }
-        PaintGraph(p, M.Cell(c, C_GRAPH, top), r.stats, P);
+        for (int k = C_GRAPH; k <= C_HIST; k++) PaintGraph(p, M.Cell(c, k, top), k, r.stats, P);
         int i = first_ + slot;
         if (i + 1 < (int)rows_.size()) {   // the empty row at the end has no handle: it stays last
             bool active = dragRow_ ? dragRow_ == rows_[(size_t)i].get() : i == gripHover_;
@@ -619,18 +619,18 @@ void Window::paintEvent(QPaintEvent*)
     }
 }
 
-void Window::PaintGraph(QPainter& p, const Rect& box, const Stats& s, const Palette& P)
+// The chart in column col (C_GRAPH or C_HIST) of a row's statistics.
+void Window::PaintGraph(QPainter& p, const Rect& box, int col, const Stats& s, const Palette& P)
 {
     p.save();
     p.translate(box.x, box.y);
     p.setRenderHint(QPainter::Antialiasing, false);
     p.fillRect(0, 0, box.w, box.h, Colour(P.graphBack));
-    Graph g = LayoutGraph(s, box.w, box.h);
+    Graph g = LayoutChart(s, col, box.w, box.h);
     int bottom = g.plot.y + g.plot.h;
 
     // Grid lines at 25 / 50 / 75 %.
-    p.setPen(Colour(P.graphGrid));
-    for (int gy : g.gridY) p.drawLine(g.plot.x, gy, g.plot.x + g.plot.w - 1, gy);
+    for (const Rect& l : g.grid) p.fillRect(l.x, l.y, l.w, l.h, Colour(P.graphGrid));
 
     for (const GraphBar& b : g.bars) {
         if (!b.timeout) {
@@ -641,11 +641,13 @@ void Window::PaintGraph(QPainter& p, const Rect& box, const Stats& s, const Pale
         }
     }
 
-    // Scale label, top-left, on a backing of the graph's own colour that keeps it legible over tall bars.
+    // Scale label, in the graph's top left corner and the histogram's top right, on a backing of
+    // the chart's own colour that keeps it legible over tall bars.
     QFont small = UiFont(FONT_SMALL_PT);
     QFontMetrics fm(small);
     QString label = Q(g.scaleLabel);
-    QRect lr(g.plot.x + M.S(3), g.plot.y + M.S(1), fm.horizontalAdvance(label), fm.height());
+    int lw = fm.horizontalAdvance(label);
+    QRect lr(g.labelRight ? g.plot.x + g.plot.w - M.S(3) - lw : g.plot.x + M.S(3), g.plot.y + M.S(1), lw, fm.height());
     p.fillRect(lr, Colour(P.graphBack));
     p.setFont(small);
     p.setPen(Colour(P.graphLabel));

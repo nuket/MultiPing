@@ -22,7 +22,7 @@
 // SOFTWARE.
 
 // MultiPingCore.h - what every MultiPing front end shares: the timing, the layout, the statistics
-// and how they read, the graph's geometry, and the files the addresses and the window's place are
+// and how they read, the charts' geometry, and the files the addresses and the window's place are
 // kept in. No toolkit and no system calls here: the Win32, GTK, Qt and Cocoa front ends draw and
 // ping, this decides what and where. Header-only C++14, so each front end stays one source file
 // and the XP toolsets build it too.
@@ -81,22 +81,22 @@ enum {
     W_NOTES       = 180,
     W_CUR         = 110,
     W_STAT        = 92,
-    W_GRAPH_MIN   = 200,
-    GRAPH_GAP     = 28,    // extra space between the Max column and the graph
-    DEL_GAP       = 10,    // extra space between the graph and the delete button
+    W_CHART_MIN   = 97,    // each of the two charts; with the gap between them, 200 together
+    GRAPH_GAP     = 28,    // extra space between the Max column and the charts
+    DEL_GAP       = 10,    // extra space between the charts and the delete button
     W_DEL         = 24,
-    W_EXTRA       = 135,   // the first window's width beyond the minimum: a graph about 335 px wide
+    W_EXTRA       = 135,   // the first window's width beyond the minimum: two charts about 165 px wide
     GRIP_DOT      = 3,     // the handle's six dots, two across and three down,
     GRIP_PITCH    = 6,     // this far apart
     DEFAULT_ROWS  = 8,     // the first window fits this many rows
     MIN_ROWS      = 2,     // the window is never made shorter than this many
 };
 
-enum { C_GRIP, C_ADDR, C_NOTES, C_CUR, C_MIN, C_MED, C_AVG, C_MAX, C_GRAPH, C_DEL, NCOL };
-static const int kColBase[NCOL] = { W_GRIP, W_ADDR, W_NOTES, W_CUR, W_STAT, W_STAT, W_STAT, W_STAT, W_GRAPH_MIN, W_DEL };
-static const char* const kColNames[NCOL] = { "", "Address", "Notes", "Current", "Min", "Median", "Avg", "Max", "Last 60 s", "" };
+enum { C_GRIP, C_ADDR, C_NOTES, C_CUR, C_MIN, C_MED, C_AVG, C_MAX, C_GRAPH, C_HIST, C_DEL, NCOL };
+static const int kColBase[NCOL] = { W_GRIP, W_ADDR, W_NOTES, W_CUR, W_STAT, W_STAT, W_STAT, W_STAT, W_CHART_MIN, W_CHART_MIN, W_DEL };
+static const char* const kColNames[NCOL] = { "", "Address", "Notes", "Current", "Min", "Median", "Avg", "Max", "Last 60 s", "Histogram", "" };
 // Columns whose header and values are left aligned; the rest are right aligned.
-inline bool LeftAligned(int col) { return col == C_ADDR || col == C_NOTES || col == C_GRAPH; }
+inline bool LeftAligned(int col) { return col == C_ADDR || col == C_NOTES || col == C_GRAPH || col == C_HIST; }
 
 struct Rgb { unsigned char r, g, b; };
 
@@ -164,10 +164,49 @@ inline std::string FormatMs(double ms)
     return b;
 }
 
-// One address's session: every reply's round trip for the statistics, and the last RING_N
-// results for the graph.
+// The round trips are counted in bins, one for each value the columns can show (0.01 ms steps
+// under 10 ms, 0.1 ms under 100 ms, 1 ms under a second, and one bin for anything longer), each
+// holding the replies that show as that value, so a session takes the same memory however long
+// it runs, and the median reads as it would from every reply (give or take a unit of the last
+// digit when there are two middle replies to average).
+enum { NBINS = 1000 + 900 + 900 + 1 };
+
+// The bin that counts a round trip of `us` microseconds.
+inline int BinOf(int us)
+{
+    if (us < 9995)   return (us + 5) / 10;
+    if (us < 99950)  return 1000 + (us - 10000 + 50) / 100;
+    if (us < 999500) return 1900 + (us - 100000 + 500) / 1000;
+    return NBINS - 1;
+}
+
+// The round trip bin i stands for, in ms: what its replies show as.
+inline double BinMs(int i)
+{
+    if (i < 1000) return i * 0.01;
+    if (i < 1900) return 10.0 + (i - 1000) * 0.1;
+    return 100.0 + (i - 1900);
+}
+
+// The shortest round trip bin i counts, in microseconds; the bin ends where BinLow(i + 1) begins
+// (the last one, counting every reply of a second or more, is taken as a millisecond wide).
+inline int BinLow(int i)
+{
+    if (i <= 0)    return 0;
+    if (i < 1000)  return i * 10 - 5;
+    if (i == 1000) return 9995;
+    if (i < 1900)  return 10000 + (i - 1000) * 100 - 50;
+    if (i == 1900) return 99950;
+    return 100000 + (i - 1900) * 1000 - 500;
+}
+
+// One address's session: every reply's round trip counted in its bin, for the Median column and
+// the histogram, the running Min, Avg and Max, and the last RING_N results for the graph.
 struct Stats {
-    std::vector<double> samples;    // all successful round trips this session, in ms
+    unsigned bins[NBINS];           // the replies this session, counted by round trip
+    unsigned count;                 // all of them
+    int minUs, maxUs;
+    long long sumUs;
     int ring[RING_N];               // last RING_N results: >= 0 round trip in us, -1 timeout
     int ringCount, ringHead;
     int last;                       // the latest result: us or RES_*
@@ -176,7 +215,10 @@ struct Stats {
 
     void Reset()
     {
-        samples.clear();
+        memset(bins, 0, sizeof bins);
+        count = 0;
+        minUs = maxUs = 0;
+        sumUs = 0;
         ringCount = ringHead = 0;
         last = RES_NONE;
     }
@@ -185,12 +227,26 @@ struct Stats {
     void Record(int res)
     {
         last = res;
-        if (res >= 0) { samples.push_back((double)res / 1000.0); Push(res); }
-        else if (res == RES_TIMEOUT) Push(-1);
+        if (res >= 0) {
+            if (count == 0 || res < minUs) minUs = res;
+            if (count == 0 || res > maxUs) maxUs = res;
+            sumUs += res;
+            count++;
+            bins[BinOf(res)]++;
+            Push(res);
+        } else if (res == RES_TIMEOUT) Push(-1);
     }
 
     // The i-th of the ringCount results in the graph, oldest first.
     int At(int i) const { return ring[(ringHead + RING_N - ringCount + i) % RING_N]; }
+
+    // The bin holding the k-th shortest reply, k from 0 and below count.
+    int BinAtRank(unsigned k) const
+    {
+        unsigned seen = 0;
+        for (int i = 0; i < NBINS; i++) { seen += bins[i]; if (seen > k) return i; }
+        return NBINS - 1;
+    }
 
     // The Current column.
     std::string Current() const
@@ -204,19 +260,13 @@ struct Stats {
     // The Min, Median, Avg and Max columns, "-" before the first reply.
     void Summary(std::string out[4]) const
     {
-        if (samples.empty()) { for (int i = 0; i < 4; i++) out[i] = "-"; return; }
-        double mn = samples[0], mx = samples[0], sum = 0;
-        for (double v : samples) { if (v < mn) mn = v; if (v > mx) mx = v; sum += v; }
-        double avg = sum / (double)samples.size();
-        std::vector<double> tmp(samples);
-        size_t n = tmp.size();
-        std::nth_element(tmp.begin(), tmp.begin() + n / 2, tmp.end());
-        double med = tmp[n / 2];
-        if ((n % 2) == 0) {
-            double lo = *std::max_element(tmp.begin(), tmp.begin() + n / 2);
-            med = (lo + med) / 2.0;
-        }
-        out[0] = FormatMs(mn); out[1] = FormatMs(med); out[2] = FormatMs(avg); out[3] = FormatMs(mx);
+        if (count == 0) { for (int i = 0; i < 4; i++) out[i] = "-"; return; }
+        double med = BinMs(BinAtRank(count / 2));
+        if ((count % 2) == 0) med = (BinMs(BinAtRank(count / 2 - 1)) + med) / 2.0;
+        out[0] = FormatMs((double)minUs / 1000.0);
+        out[1] = FormatMs(med);
+        out[2] = FormatMs((double)sumUs / (double)count / 1000.0);
+        out[3] = FormatMs((double)maxUs / 1000.0);
     }
 
 private:
@@ -244,17 +294,18 @@ struct Metrics {
     // A size in points as pixels at this dpi.
     int Pt(int pt) const { return (int)(((long long)pt * dpi + 36) / 72); }
 
-    // The columns across a client area clientW wide: all fixed but the graph, which takes the rest.
+    // The columns across a client area clientW wide: all fixed but the two charts, which share
+    // the rest equally.
     Cols Columns(int clientW) const
     {
         Cols c;
         int fixed = 0;
         for (int i = 0; i < NCOL; i++) {
             c.w[i] = S(kColBase[i]);
-            if (i != C_GRAPH) fixed += c.w[i];
+            if (i != C_GRAPH && i != C_HIST) fixed += c.w[i];
         }
         int avail = clientW - 2 * S(MARGIN) - (NCOL - 1) * S(GAP) - S(GRAPH_GAP) - S(DEL_GAP) - fixed;
-        if (avail > c.w[C_GRAPH]) c.w[C_GRAPH] = avail;
+        if (avail > c.w[C_GRAPH] + c.w[C_HIST]) { c.w[C_GRAPH] = avail / 2; c.w[C_HIST] = avail - avail / 2; }
         c.x[0] = S(MARGIN);
         for (int i = 1; i < NCOL; i++)
             c.x[i] = c.x[i - 1] + c.w[i - 1] + S(GAP) + (i == C_GRAPH ? S(GRAPH_GAP) : i == C_DEL ? S(DEL_GAP) : 0);
@@ -285,11 +336,11 @@ struct Metrics {
     int RowTop(int slot) const { return RowsTop() + slot * S(ROW_H); }
 
     // Where column `col` of the row whose top is rowTop goes: the controls centred in the row,
-    // the graph nearly its full height, the delete button a square.
+    // the charts nearly its full height, the delete button a square.
     Rect Cell(const Cols& c, int col, int rowTop) const
     {
         Rect r = { c.x[col], rowTop + (S(ROW_H) - S(CTRL_H)) / 2, c.w[col], S(CTRL_H) };
-        if (col == C_GRAPH) { r.y = rowTop + S(3); r.h = S(ROW_H) - S(6); }
+        if (col == C_GRAPH || col == C_HIST) { r.y = rowTop + S(3); r.h = S(ROW_H) - S(6); }
         if (col == C_DEL)   { r.y = rowTop + (S(ROW_H) - c.w[C_DEL]) / 2; r.h = c.w[C_DEL]; }
         return r;
     }
@@ -341,7 +392,7 @@ template <class T> void MoveItem(std::vector<T>& v, size_t from, size_t to)
 }
 
 // ---------------------------------------------------------------------------------------------
-// The graph
+// The charts: the graph of the last 60 s and the histogram of the session
 // ---------------------------------------------------------------------------------------------
 
 // Rounds a microsecond value up to a readable axis maximum (0.1 ms, 0.2, 0.5, 1, 2, 5, 10 ... 10 s).
@@ -353,21 +404,26 @@ inline int NiceCeil(int v)
     return ((v + 9999999) / 10000000) * 10000000;
 }
 
-// One second in the graph: a reply's bar from `top` down to the plot's bottom, or a timeout,
-// the plot's whole height with a strip of the timeout colour along its top.
+// A bar from `top` down to the plot's bottom: in the graph a reply's second, or a timeout, the
+// plot's whole height with a strip of the timeout colour along its top; in the histogram the
+// replies of one round trip length.
 struct GraphBar { int x0, x1, top; bool timeout; };
 
-// The graph of a W by H box, inside its one-pixel border: the plot, the grid lines across it at
-// a quarter, half and three quarters, one bar per result with the newest at the right edge, and
-// the scale at the top, "2.00 ms".
+// A chart in a W by H box, inside its one-pixel border: the plot, three grid lines a pixel wide
+// across it at a quarter, half and three quarters (horizontal in the graph, vertical in the
+// histogram), the bars, and the scale at the top, "2.00 ms", in the left corner of the graph
+// (its height) and the right corner of the histogram (its width).
 struct Graph {
     Rect plot;
-    int gridY[3];
+    Rect grid[3];
     int scaleUs;
     std::string scaleLabel;
+    bool labelRight;
     std::vector<GraphBar> bars;
 };
 
+// The last RING_N results, one bar per second with the newest at the right edge, against a scale
+// that holds the longest of them.
 inline Graph LayoutGraph(const Stats& s, int W, int H)
 {
     Graph g;
@@ -377,7 +433,8 @@ inline Graph LayoutGraph(const Stats& s, int W, int H)
     for (int i = 0; i < s.ringCount; i++) if (s.At(i) > maxv) maxv = s.At(i);
     g.scaleUs = NiceCeil(maxv < 1 ? 1000 : maxv);   // 1 ms scale until there is data
     g.scaleLabel = FormatMs((double)g.scaleUs / 1000.0) + " ms";
-    for (int q = 1; q < 4; q++) g.gridY[q - 1] = bottom - ph * q / 4;
+    g.labelRight = false;
+    for (int q = 1; q < 4; q++) { Rect r = { left, bottom - ph * q / 4, pw, 1 }; g.grid[q - 1] = r; }
     for (int i = 0; i < s.ringCount; i++) {
         int slot = RING_N - s.ringCount + i;                 // newest sample at the right edge
         GraphBar b;
@@ -395,6 +452,56 @@ inline Graph LayoutGraph(const Stats& s, int W, int H)
         g.bars.push_back(b);
     }
     return g;
+}
+
+// The session's replies by round trip, from 0 at the left edge to the scale at the right: a
+// column of pixels for each stretch of the scale, as tall as the replies in it, the tallest the
+// plot's height and any with a reply at least a pixel. The scale holds all but the longest
+// hundredth of the replies, so that a few slow ones do not squash the rest into the first
+// pixels; those beyond it are counted in the last column.
+inline Graph LayoutHistogram(const Stats& s, int W, int H)
+{
+    Graph g;
+    g.plot.x = 1; g.plot.y = 1; g.plot.w = W - 2; g.plot.h = H - 2;
+    int left = g.plot.x, top = g.plot.y, pw = g.plot.w, ph = g.plot.h, bottom = top + ph;
+    int longest = s.count ? BinLow(s.BinAtRank(s.count - 1 - s.count / 100) + 1) : 1000;
+    g.scaleUs = NiceCeil(longest);
+    g.scaleLabel = FormatMs((double)g.scaleUs / 1000.0) + " ms";
+    g.labelRight = true;
+    for (int q = 1; q < 4; q++) { Rect r = { left + pw * q / 4, top, 1, ph }; g.grid[q - 1] = r; }
+    if (pw < 1 || ph < 1) return g;
+
+    // The replies in each pixel column; a bin wider than a column is spread over those it covers.
+    std::vector<double> cols((size_t)pw, 0.0);
+    for (int i = 0; i < NBINS; i++) {
+        if (!s.bins[i]) continue;
+        double n = (double)s.bins[i];
+        double xa = (double)BinLow(i) * pw / g.scaleUs, xb = (double)BinLow(i + 1) * pw / g.scaleUs;
+        if (xa >= pw) { cols[(size_t)pw - 1] += n; continue; }
+        for (int x = (int)xa; x < pw && x < xb; x++) {
+            double lo = x > xa ? x : xa, hi = x + 1 < xb ? x + 1 : xb;
+            cols[(size_t)x] += n * (hi - lo) / (xb - xa);
+        }
+        if (xb > pw) cols[(size_t)pw - 1] += n * (xb - pw) / (xb - xa);
+    }
+    double tallest = 0;
+    for (double c : cols) if (c > tallest) tallest = c;
+    for (int x = 0; x < pw; x++) {
+        if (cols[(size_t)x] <= 0) continue;
+        int t = bottom - (int)(cols[(size_t)x] * ph / tallest);
+        if (t >= bottom) t = bottom - 1;
+        if (t < top) t = top;
+        if (!g.bars.empty() && g.bars.back().x1 == left + x && g.bars.back().top == t) { g.bars.back().x1++; continue; }
+        GraphBar b = { left + x, left + x + 1, t, false };
+        g.bars.push_back(b);
+    }
+    return g;
+}
+
+// The chart in column col: the graph in C_GRAPH, the histogram in C_HIST.
+inline Graph LayoutChart(const Stats& s, int col, int W, int H)
+{
+    return col == C_HIST ? LayoutHistogram(s, W, H) : LayoutGraph(s, W, H);
 }
 
 // The delete button's glyph in a W by H box: a filled circle and a white X across it.

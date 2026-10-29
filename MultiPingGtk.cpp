@@ -445,7 +445,7 @@ static gboolean OnTick(gpointer)
 {
     if (g_closing) return G_SOURCE_REMOVE;
     for (auto& r : g_rows) {
-        int res;
+        int res = RES_NONE;
         if (r->pinger && r->pinger->Tick(&res)) r->stats.Record(res);
     }
     gtk_widget_queue_draw(g_area);
@@ -456,7 +456,8 @@ static gboolean OnTick(gpointer)
 // Painting
 // ---------------------------------------------------------------------------------------------
 
-static void PaintGraph(cairo_t* cr, const Rect& box, const Stats& s, const Palette& P)
+// The chart in column col (C_GRAPH or C_HIST) of a row's statistics.
+static void PaintGraph(cairo_t* cr, const Rect& box, int col, const Stats& s, const Palette& P)
 {
     cairo_save(cr);
     cairo_translate(cr, box.x, box.y);
@@ -464,12 +465,12 @@ static void PaintGraph(cairo_t* cr, const Rect& box, const Stats& s, const Palet
     SetColour(cr, P.graphBack);
     cairo_rectangle(cr, 0, 0, box.w, box.h);
     cairo_fill(cr);
-    Graph g = LayoutGraph(s, box.w, box.h);
+    Graph g = LayoutChart(s, col, box.w, box.h);
     int bottom = g.plot.y + g.plot.h;
 
     // Grid lines at 25 / 50 / 75 %, one pixel each.
     SetColour(cr, P.graphGrid);
-    for (int gy : g.gridY) cairo_rectangle(cr, g.plot.x, gy, g.plot.w, 1);
+    for (const Rect& l : g.grid) cairo_rectangle(cr, l.x, l.y, l.w, l.h);
     cairo_fill(cr);
 
     for (const GraphBar& b : g.bars) {
@@ -483,10 +484,11 @@ static void PaintGraph(cairo_t* cr, const Rect& box, const Stats& s, const Palet
         }
     }
 
-    // Scale label, top-left, on a backing of the graph's own colour that keeps it legible over tall bars.
+    // Scale label, in the graph's top left corner and the histogram's top right, on a backing of
+    // the chart's own colour that keeps it legible over tall bars.
     PangoFontDescription* small = UiFont(FONT_SMALL_PT);
     int lh, lw = TextWidth(cr, small, g.scaleLabel.c_str(), &lh);
-    Rect lr = { g.plot.x + M.S(3), g.plot.y + M.S(1), lw, lh };
+    Rect lr = { g.labelRight ? g.plot.x + g.plot.w - M.S(3) - lw : g.plot.x + M.S(3), g.plot.y + M.S(1), lw, lh };
     SetColour(cr, P.graphBack);
     cairo_rectangle(cr, lr.x, lr.y, lr.w, lr.h);
     cairo_fill(cr);
@@ -600,7 +602,7 @@ static gboolean OnDraw(GtkWidget* area, cairo_t* cr, gpointer)
     cairo_rectangle(cr, c.x[0], y + M.S(HDR_H), c.x[NCOL - 1] + c.w[NCOL - 1] - c.x[0], 1);
     cairo_fill(cr);
 
-    // The visible rows: handle, labels, graph, delete button; the boxes are widgets of their own.
+    // The visible rows: handle, labels, charts, delete button; the boxes are widgets of their own.
     int fit = Fit();
     for (int slot = 0; slot < fit && g_first + slot < (int)g_rows.size(); slot++) {
         const Row& r = *g_rows[(size_t)(g_first + slot)];
@@ -610,7 +612,7 @@ static gboolean OnDraw(GtkWidget* area, cairo_t* cr, gpointer)
         r.stats.Summary(labels + 1);
         gdk_cairo_set_source_rgba(cr, &fg);
         for (int k = C_CUR; k <= C_MAX; k++) DrawText(cr, font, labels[k - C_CUR].c_str(), M.Cell(c, k, top), true, true);
-        PaintGraph(cr, M.Cell(c, C_GRAPH, top), r.stats, P);
+        for (int k = C_GRAPH; k <= C_HIST; k++) PaintGraph(cr, M.Cell(c, k, top), k, r.stats, P);
         int i = g_first + slot;
         if (i + 1 < (int)g_rows.size()) {   // the empty row at the end has no handle: it stays last
             bool active = g_dragRow ? g_dragRow == g_rows[(size_t)i].get() : i == g_gripHover;

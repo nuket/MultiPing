@@ -3,7 +3,8 @@
 [![Build](https://github.com/nuket/MultiPing/actions/workflows/build.yml/badge.svg)](https://github.com/nuket/MultiPing/actions/workflows/build.yml)
 
 A small tool that pings a list of hosts once a second and shows, per host, the current
-round-trip time, session min / median / avg / max, and a bar graph of the last 60 seconds.
+round-trip time, session min / median / avg / max, a bar graph of the last 60 seconds, and a
+histogram of the session's round trips.
 
 It runs on Windows (XP SP3 and later), macOS (11 and later) and Linux (GTK 3, Qt 5 or Qt 6),
 with the same look everywhere and no extra dependencies.
@@ -21,8 +22,8 @@ with the same look everywhere and no extra dependencies.
 | `MultiPingXP.exe` | 32- and 64-bit Windows XP SP3 and later | MinGW-w64 GCC (MSYS2 mingw32), msvcrt.dll | about 521 KB |
 | `multiping-gtk` | Linux with GTK 3: Debian 12, Ubuntu 24.04 and later | g++ in Debian bookworm | about 164 KB |
 | `multiping-qt5` | Linux with Qt 5.15 | g++ in Debian bookworm | about 176 KB |
-| `multiping-qt6` | Linux with Qt 6.4 or later | g++ in Debian bookworm | about 180 KB |
-| `MultiPing.app` | macOS 11 and later, Apple silicon and Intel | Apple clang, AppKit | about 408 KB |
+| `multiping-qt6` | Linux with Qt 6.4 or later | g++ in Debian bookworm | about 184 KB |
+| `MultiPing.app` | macOS 11 and later, Apple silicon and Intel | Apple clang, AppKit | about 403 KB |
 
 The two Windows builds behave identically; every version-dependent feature is resolved at runtime,
 and the XP build is the more portable of the two. On Linux, pick the kit the desktop uses: GTK on
@@ -38,7 +39,9 @@ GNOME, Qt on KDE.
 - Drag the dots at a row's left up or down to move the row; dragged above or below the rows shown, the
   list scrolls along.
 - Stats (min / median / avg / max) cover the whole session for that address; the graph shows the last 60 pings,
-  one per second, with timeouts drawn in red.
+  one per second, with timeouts drawn in red; the histogram shows how the session's replies are spread, from
+  0 at its left edge to the scale at its right, which holds all but the slowest 1 % (those are counted in the
+  last column). A session takes the same memory however long it runs.
 - The window opens sized for 8 rows; a scrollbar appears only when there are more.
 - The rows are saved to `addresses.txt` on every change and on exit, in `%APPDATA%\MultiPing` on Windows,
   `~/.config/MultiPing` on Linux and `~/Library/Application Support/MultiPing` on macOS: a line per row,

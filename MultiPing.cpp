@@ -124,7 +124,7 @@ struct PingCtx {
 struct Row {
     int           id;
     std::wstring  addr, notes;
-    HWND          grip, edit, notesEdit, cur, mn, med, avg, mx, graph, del;
+    HWND          grip, edit, notesEdit, cur, mn, med, avg, mx, graph, hist, del;
     PingCtx*      ctx;
     Stats         stats;
 };
@@ -132,7 +132,7 @@ struct Row {
 // A row's windows in column order.
 static void RowWindows(const Row* r, HWND ctl[NCOL])
 {
-    HWND all[NCOL] = { r->grip, r->edit, r->notesEdit, r->cur, r->mn, r->med, r->avg, r->mx, r->graph, r->del };
+    HWND all[NCOL] = { r->grip, r->edit, r->notesEdit, r->cur, r->mn, r->med, r->avg, r->mx, r->graph, r->hist, r->del };
     for (int k = 0; k < NCOL; k++) ctl[k] = all[k];
 }
 
@@ -649,6 +649,7 @@ static void RecordResult(Row* r, int res)
     r->stats.Record(res);
     UpdateLabels(r);
     InvalidateRect(r->graph, NULL, FALSE);
+    InvalidateRect(r->hist, NULL, FALSE);
 }
 
 static HWND MakeStatic(DWORD style)
@@ -695,6 +696,8 @@ static Row* AddRow(const std::wstring& addr, const std::wstring& notes)
     r->mx  = MakeStatic(SS_RIGHT);
     r->graph = CreateWindowExW(0, L"MultiPingGraph", NULL, WS_CHILD | WS_VISIBLE,
                                0, 0, 10, 10, g_hwnd, NULL, hi, r);
+    r->hist = CreateWindowExW(0, L"MultiPingGraph", NULL, WS_CHILD | WS_VISIBLE,
+                              0, 0, 10, 10, g_hwnd, NULL, hi, r);
     r->del = CreateWindowExW(0, L"MultiPingDelete", NULL, WS_CHILD | WS_VISIBLE,
                              0, 0, 10, 10, g_hwnd, NULL, hi, r);
 
@@ -736,6 +739,7 @@ static bool ApplyEdit(Row* r)
     r->stats.Reset();
     UpdateLabels(r);
     InvalidateRect(r->graph, NULL, FALSE);
+    InvalidateRect(r->hist, NULL, FALSE);
     StartPing(r);
     SaveAddresses();
     return true;
@@ -793,7 +797,7 @@ static LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM w, LPARAM l)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Graph control
+// Chart control: a row's graph and its histogram are two windows of this class
 // ---------------------------------------------------------------------------------------------
 
 static void PaintGraph(HWND h, Row* r)
@@ -813,16 +817,15 @@ static void PaintGraph(HWND h, Row* r)
     FillRect(mdc, &rc, back);
     DeleteObject(back);
 
-    Graph g = LayoutGraph(r->stats, W, H);
+    Graph g = LayoutChart(r->stats, h == r->hist ? C_HIST : C_GRAPH, W, H);
     int bottom = g.plot.y + g.plot.h;
 
     // Grid lines at 25 / 50 / 75 %.
-    HPEN grid = CreatePen(PS_SOLID, 1, Colour(P.graphGrid));
-    HGDIOBJ oldPen = SelectObject(mdc, grid);
-    for (int y : g.gridY) {
-        MoveToEx(mdc, g.plot.x, y, NULL); LineTo(mdc, g.plot.x + g.plot.w, y);
+    HBRUSH grid = CreateSolidBrush(Colour(P.graphGrid));
+    for (const Rect& l : g.grid) {
+        RECT line = { l.x, l.y, l.x + l.w, l.y + l.h };
+        FillRect(mdc, &line, grid);
     }
-    SelectObject(mdc, oldPen);
     DeleteObject(grid);
 
     HBRUSH blue = CreateSolidBrush(Colour(P.graphBar));
@@ -840,13 +843,13 @@ static void PaintGraph(HWND h, Row* r)
     }
     DeleteObject(blue); DeleteObject(pink); DeleteObject(red);
 
-    // Scale label, top-left.
+    // Scale label, in the graph's top left corner and the histogram's top right.
     HGDIOBJ oldFont = SelectObject(mdc, g_fontSmall);
-    SetBkMode(mdc, OPAQUE);                 // the graph's colour behind it keeps the label legible over tall bars
+    SetBkMode(mdc, OPAQUE);                 // the chart's colour behind it keeps the label legible over tall bars
     SetBkColor(mdc, Colour(P.graphBack));
     SetTextColor(mdc, Colour(P.graphLabel));
-    RECT lr = { g.plot.x + S(3), g.plot.y + S(1), g.plot.x + g.plot.w, bottom };
-    DrawTextW(mdc, Widen(g.scaleLabel).c_str(), -1, &lr, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+    RECT lr = { g.plot.x + S(3), g.plot.y + S(1), g.plot.x + g.plot.w - S(3), bottom };
+    DrawTextW(mdc, Widen(g.scaleLabel).c_str(), -1, &lr, (g.labelRight ? DT_RIGHT : DT_LEFT) | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
     SelectObject(mdc, oldFont);
 
     HBRUSH border = CreateSolidBrush(Colour(P.graphBorder));
